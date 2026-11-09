@@ -1,661 +1,307 @@
-# EvidenceOps — local development
+# EvidenceOps
 
-EvidenceOps is a learning project for inspecting synthetic industrial records,
-searching cited evidence, calculating investigation facts, and preparing incident
-drafts. It is **not production ready**. No model response or benchmark label is
-invented. The source data remains local and is excluded from Git.
+**Evidence-grounded RAG and a bounded MCP agent for manufacturing quality investigations — local, bilingual (English and Traditional Chinese), and human-approved.**
 
-The local flow is: terminal or browser → document loader → lexical search and
-deterministic calculations → cited results. SQLite stores uploaded documents,
-version events, label reviews, and ticket decisions. MCP tools expose only
-selected data operations. PostgreSQL and model adapters are optional paths.
-The three fixed investigations use ordinary Python functions; no graph runtime
-or model is needed for them.
+[![Offline source checks](https://github.com/manideepreddyyanala4-svg/LLM-RAG/actions/workflows/offline.yml/badge.svg)](https://github.com/manideepreddyyanala4-svg/LLM-RAG/actions/workflows/offline.yml)
 
-## Quick start in Windows CMD
+EvidenceOps is a learning and portfolio project. It is **not production ready**, and it runs on **synthetic** data only.
 
-From the existing project folder:
+## The problem
 
-```cmd
-cd /d "D:\LLM-RAG project"
-.venv\Scripts\python.exe -m pip install -r requirements.txt
-.venv\Scripts\python.exe -m unittest -q
-set EVIDENCEOPS_TOKEN=choose-a-long-random-local-secret
-set EVIDENCEOPS_OPERATOR_TOKEN=choose-a-different-long-random-operator-secret
-set EVIDENCEOPS_APPROVAL_TOKEN=choose-a-different-long-random-secret
-.venv\Scripts\python.exe -m uvicorn api:app --host 127.0.0.1 --port 8000
+A camera-inspection line starts rejecting more parts after a new model version is deployed. An engineer has to answer questions like these:
+
+- *What does the current SOP say?*
+- *What changed between deployments?*
+- *Should an incident be opened?*
+
+The evidence is split across bilingual SOPs, inspection counts and deployment records.
+
+A chatbot that answers confidently is dangerous here: one invented threshold or approver can send the investigation the wrong way. EvidenceOps is built around four rules:
+
+1. **Every answer must cite retrieved evidence**, and every quotation is checked word for word in Python.
+2. **When the evidence is not there, the system says so** instead of guessing.
+3. **The agent's tools are limited in code**, not just in the prompt.
+4. **Only a person holding a separate approval token can approve an incident.** The AI can only prepare a pending draft.
+
+Everything runs locally: FastAPI, SQLite, and Ollama on `127.0.0.1`. No data is sent to a hosted model.
+
+## Demo
+
+[▶ Demo video (72 s, MP4)](docs/evidenceops-demo.mp4) — the real dashboard driven in headless Chrome against real Ollama models. It shows upload → embed → cited answers in English and Chinese → abstention → MCP agent → pending draft → approval denied with the wrong token → approval with the right one → audit trail.
+
+| Cited answer (English, from a newly uploaded SOP) | Cited answer (Traditional Chinese) |
+|---|---|
+| ![English answer with verified quotation](docs/answer-english.png) | ![Chinese answer with verified quotation](docs/answer-chinese.png) |
+
+| Agent tool calls over MCP | Wrong approval token refused | Approved, with audit trail |
+|---|---|---|
+| ![Agent steps](docs/agent-steps.png) | ![Approval denied](docs/approval-denied.png) | ![Audit trail](docs/approved-audit-trail.png) |
+
+## What works
+
+| Feature | Status |
+|---|---|
+| Keyword, BM25, semantic (vector) and hybrid retrieval over the same chunks | Works, tested |
+| Real embeddings with `qwen3-embedding:0.6b` (1024 dimensions), cached per model digest | Works, tested |
+| Grounded answers with `qwen2.5:7b`; citation and verbatim-quote checks; abstention | Works, tested |
+| English and Traditional Chinese questions, documents and answers | Works; Chinese is weaker (see limitations) |
+| Prompt-injection filter for passages that give orders to the AI | Works for the tested patterns; a heuristic |
+| Bounded agent calling four approved tools through a real MCP server | Works, tested |
+| Pending incident drafts; separate human approval token; audit trail | Works, tested |
+| Document versions, soft delete and restore, original-file download, PDF text | Works, tested |
+| Deterministic rejection-rate investigation and deployment comparison | Works, tested |
+| SQLite persistence across restarts; backup and restore | Works, tested |
+| Optional PostgreSQL/pgvector adapter | Tested in CI with synthetic records; not used by the API |
+| Retrieval or answer accuracy on human-reviewed labels | **Not established.** No reviewed benchmark exists yet |
+
+## Architecture
+
+```mermaid
+flowchart LR
+    U[Browser dashboard<br/>dashboard.html] -->|token headers| A[FastAPI<br/>api.py]
+    CLI[Terminal<br/>main.py] --> R
+    A --> R[AI layer<br/>rag.py]
+    A --> D[(SQLite<br/>documents, tickets,<br/>vectors, AI runs)]
+    R --> RT[retrieval.py<br/>keyword · BM25 · cosine · hybrid]
+    R --> OC[ollama_client.py<br/>embed · generate · check claims]
+    OC -->|127.0.0.1 only| O[Ollama<br/>qwen3-embedding:0.6b<br/>qwen2.5:7b]
+    R -->|stdio, filtered env| M[MCP server<br/>mcp_server.py<br/>4 approved tools]
+    M --> I[investigation.py<br/>metrics · tickets]
+    M --> D
+    R --> D
 ```
 
-Open `http://127.0.0.1:8000/` in the same laptop's browser. Enter the three
-distinct tokens in its header. The access token reads evidence; the operator
-token manages local documents and prepares incident drafts; the approval token
-confirms manual labels and changes ticket decisions. The access token is also
-required for operator and approver requests. These values stay in your CMD
-session and are not saved by the dashboard. Use a private laptop session and
-do not share them. Token rotation takes effect on the next request. This is a
-local role boundary, not user identity or production authentication.
+### How one answer is produced
 
-The terminal application remains available:
+1. **Retrieve.** Up to three chunks are ranked with the chosen method. Superseded and deleted versions are filtered out *before* ranking, so they can never be cited.
+2. **Filter.** Passages that address the AI ("ignore previous instructions", "admin mode", 忽略…指示) are removed from the prompt and shown to the user as *excluded*.
+3. **Generate.** The model must return JSON *claims*. Each claim has text, a citation such as `E1`, and a quotation. An empty list is the only way to abstain.
+4. **Check in Python.** The citation must name a retrieved passage, and the quote must appear in it **word for word**.
+5. **Check with the model.** Each claim is compared with *only* the passage it cites.
+6. **Decide.** The answer is shown only if every check passes. Otherwise the status is `withheld` or `insufficient`, and the blocked claims are kept for a person to read. Every run is saved.
 
-```cmd
-.venv\Scripts\python.exe main.py
-.venv\Scripts\python.exe main.py inspect
-.venv\Scripts\python.exe main.py investigate
-.venv\Scripts\python.exe main.py labels
-.venv\Scripts\python.exe main.py workflow --kind inspection --question "Line B rejection rate"
-.venv\Scripts\python.exe main.py workflow --kind deployment --question "Compare Line B deployments"
-.venv\Scripts\python.exe main.py workflow --kind sop_conflict --question "Review Line B SOP versions"
-.venv\Scripts\python.exe main.py backup
-```
+### How the agent is bounded
 
-The SOP workflow creates a **pending** ticket; approval remains a separate
-action. The backup command copies existing SQLite stores into a new timestamped
-folder under ignored `data/local/backups/`. It never overwrites a prior backup.
-Restore writes only into a fresh local directory and refuses existing database
-files. For an isolated local run, set `EVIDENCEOPS_LOCAL_DIR` to an absolute
-path before starting the program. Leave it unset for the usual `data/local`
-stores.
+The agent plans one step at a time. Every rule below is enforced in Python, so it holds even if the model ignores its instructions. Unit tests use a scripted planner that ignores its instructions on purpose.
 
-On this laptop, `.venv\Scripts\python.exe -m unittest -q` ran 53 tests and
-passed. Isolated headless Chrome exercised overview, pasted and file upload,
-current/historical search and citations, soft deletion and restore, document
-history, Parquet metadata, investigations, deployment comparison, SOP workflow,
-workflow history, operator/approver denial and success, review screen, 20
-comparison rows, and the unreviewed evaluation gate. Uploaded script text was
-displayed without running. The JSON download control was exercised with an
-explicit toy browser response; the actual reviewed-only export is tested with
-a separate synthetic fixture. No supplied question was automatically reviewed.
-Temporary browser profiles and databases were removed afterward. A later
-isolated Chrome run also downloaded and checked the reviewed JSON for one
-separate toy question. No supplied starter question was marked reviewed.
+- It can use only four tools: search SOP evidence, read inspection metrics, compare deployments, and prepare an incident draft. There is no approve, SQL, shell, filesystem or network tool.
+- It can take at most 6 steps. Each action has a per-run budget, and a used-up action is no longer offered.
+- An action that was not offered at that step is refused. So are identical repeat calls.
+- A draft and `finish` are offered only after an SOP search.
+- Only one draft can be made per run. It records the person's original request, not text the model wrote.
+- The MCP process is started without the approval secret, and without the operator secret unless drafting is allowed. **No tool can approve anything.**
 
-## Fresh clone on the authorized lab computer
+### Why plain Python instead of an agent framework
 
-The original starter files are intentionally absent from Git because their
-README gives no explicit redistribution license. The public Parquet dataset is
-also absent. For a first run, `python main.py demo` creates six **new, tiny,
-explicitly synthetic** files in `EvidenceOps_Data_Starter/data/`: three SOPs,
-metrics, deployments, and one unreviewed practice question. It refuses to
-overwrite any of those names. The practice values are not factory findings or
-a retrieval benchmark. Keep actual lab records out of Git.
+The agent is a short `while` loop in `rag.py`. LangGraph was used in an earlier version and removed. A graph framework would add a dependency without changing what matters here: which actions are allowed, in what order, and how often. Those rules are about twenty lines of ordinary Python that a reviewer can read and a unit test can attack directly. MCP is kept because it is a real protocol boundary: tools run in a separate process with a reduced environment.
 
-Windows Command Prompt (use an installed Python 3.14 and Git):
+## Technology
 
-```cmd
-git clone https://github.com/manideepreddyyanala4-svg/LLM-RAG.git
-cd LLM-RAG
-py -3.14 -m venv .venv
-.venv\Scripts\python.exe -m pip install -r requirements.txt
-.venv\Scripts\python.exe main.py demo
-.venv\Scripts\python.exe -m unittest -q test_evidenceops.EvidenceTests.test_demo_data_is_explicitly_synthetic_and_never_overwrites
-set EVIDENCEOPS_TOKEN=choose-a-long-random-local-secret
-set EVIDENCEOPS_OPERATOR_TOKEN=choose-a-different-long-random-operator-secret
-set EVIDENCEOPS_APPROVAL_TOKEN=choose-a-different-long-random-secret
-.venv\Scripts\python.exe -m uvicorn api:app --host 127.0.0.1 --port 8000
-```
+Python 3.13/3.14 · FastAPI · Uvicorn · SQLite · Ollama (`qwen2.5:7b`, `qwen3-embedding:0.6b`) · MCP Python SDK (stdio) · pypdf · optional PostgreSQL/pgvector (psycopg) · plain HTML/CSS/JavaScript · `unittest` · GitHub Actions · Docker Compose.
 
-Linux shell (use an installed Python 3.14 and Git):
+## Run it
 
-```sh
-git clone https://github.com/manideepreddyyanala4-svg/LLM-RAG.git
-cd LLM-RAG
-python3.14 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python main.py demo
-.venv/bin/python -m unittest -q test_evidenceops.EvidenceTests.test_demo_data_is_explicitly_synthetic_and_never_overwrites
-export EVIDENCEOPS_TOKEN='choose-a-long-random-local-secret'
-export EVIDENCEOPS_OPERATOR_TOKEN='choose-a-different-long-random-operator-secret'
-export EVIDENCEOPS_APPROVAL_TOKEN='choose-a-different-long-random-secret'
-.venv/bin/python -m uvicorn api:app --host 127.0.0.1 --port 8000
-```
-
-Open `http://127.0.0.1:8000/` on that computer. The full 53-test suite has
-checks tied to the original ignored starter data and will fail on the tiny
-demo; run it only after placing an authorized copy of the original starter
-files there. GitHub Actions runs its smaller, dataset-free smoke selection.
-For Docker, create `data/public/` as an empty local directory if you have no
-permitted Parquet files, set the three tokens above, then run
-`docker compose -f compose.yaml up --build`. If PostgreSQL/pgvector is needed,
-also set a private `EVIDENCEOPS_PG_PASSWORD` and use
-`docker compose -f compose.yaml --profile postgres up --build`.
-The database profile is optional; the normal API continues to use SQLite.
-
-An offline MCP client/server round trip (using the same first token):
-
-```cmd
-.venv\Scripts\python.exe mcp_client.py
-```
-
-For a fresh installation, use Python 3.14, create `.venv` with `python -m venv
-.venv`, then install requirements. Place authorized local copies of the three
-SOP texts, `metrics.csv`, `deployments.csv`, and `questions.csv` in
-`EvidenceOps_Data_Starter/data/`. Place the two public Parquet files in
-`data/public/` if you want Parquet inspection. The application never downloads
-datasets. Empty or malformed required inputs produce errors instead of made-up
-answers. `data/local/` holds ingested text versions and incident drafts.
-
-## What each file teaches
-
-Read in this order:
-
-1. `retrieval.py`: `words(text)` extracts English terms; `chinese_pairs(text)`
-   extracts adjacent Han characters; `search_documents(documents, question)`
-   keeps the original baseline; `search_bilingual(documents, question)` returns
-   up to three scored chunks. `search_bm25` offers frequency and length based
-   lexical ranking. `search_vectors` ranks vectors supplied by a caller and
-   rejects invalid dimensions, values, and zero-length vectors; it does not
-   create embeddings.
-   `hybrid_search` accepts a semantic search function later and rejects
-   evidence that was not supplied to it.
-2. `data_io.py`: `read_csv(path, required)` returns validated dictionaries;
-   `load_documents(folder, include_csv, local_file)` returns text, filename,
-   location, version, status, and SHA-256 where applicable;
-   `ingest_document(store, source, version, text)` and `ingest_pdf` add a new
-   SQLite version with original bytes, a hash, and paragraph or page citations;
-   `delete_document(store, source, version)` soft-deletes one local version;
-   `restore_document` makes a deleted version current and records the change;
-   `document_history` reads its events; `backup_local_databases` makes a
-   checked SQLite snapshot and `restore_local_databases` restores into a fresh
-   directory without overwriting;
-   `document_inventory(documents)` shows version hashes and change flags;
-   `inspect_parquet(folder)` prints metadata and five sample rows.
-3. `investigation.py`: `summarize_metrics(rows)` checks counts and computes
-   line/model rates; `investigation_report(folder, documents)` returns facts
-   with source records; `prepare_ticket`, `list_tickets`, `change_ticket`, and
-   `ticket_history` manage persistent decisions and the audit trail.
-4. `evaluation.py`: `evaluate_questions(documents, questions, verified, search)`
-   returns top-1 and top-3 source hits for reviewed questions;
-   `review_label` saves a source review tied to the current CSV and cited-file hashes;
-   `compare_searches` records the two lexical ranks and timings.
-5. `main.py`: `main()` handles the original terminal commands and includes
-   current ingested local documents in search and comparisons. `evaluate
-   --json` prints a reviewed-only report for saving or inspection.
-6. `api.py` and `dashboard.html`: local HTTP endpoints and responsive browser
-   controls for search, citations, document versions, Parquet metadata, reports,
-   label review, incident drafts, approval, and fixed workflow traces.
-7. `mcp_server.py` and `mcp_client.py`: official MCP SDK stdio server and client.
-   Four tools search approved local texts, read metrics, compare deployment
-   records, and prepare a draft. The server requires a configured access token
-   in its environment. Ticket preparation also requires a separate operator
-   token and `EVIDENCEOPS_MCP_ROLE=operator`; its default role is viewer.
-   The client removes the approval token from the child environment and also
-   removes the operator token in viewer mode. Tool arguments never include
-   secrets. This is a process-wide role, not
-   per-client identity; only trusted local processes should launch it.
-   There is no ticket-approval tool.
-8. `workflow.py`: `run_workflow(question, kind)` executes bounded inspection,
-   deployment, or SOP-version review steps. Reports list sources and missing
-   information. `record_workflow_run` and `list_workflow_runs` keep the latest
-   50 completed API run reports in SQLite. Internal file paths stay out of
-   responses. The SOP workflow prepares a pending ticket. No LLM reasoning
-   or automatic ticket approval is claimed.
-9. `database.py`: optional parameterized PostgreSQL schema and functions for
-   versioned documents, chunks, inspection rows and inactive-version deletion.
-   `setup_vectors(dsn, dimensions)` requires an available pgvector extension
-   and a real embedding dimension. Nothing connects without an explicit DSN.
-10. `ollama_client.py`: the local model adapter. `list_ollama_models`,
-    `ask_ollama` and `embed_texts` require an explicitly approved loopback
-    endpoint and validate every vector they get back. `ai_settings` reads the
-    server-side choices, `installed_model` pins a model digest, `chat_ollama`
-    makes one bounded call, and `grounded_answer` generates claims then checks
-    each citation and quotation. `check_claims` is the pure-Python part of that
-    check, so read it before the model-based one.
-11. `rag.py`: the AI layer that ties the rest together. `source_id` gives each
-    chunk a stable ID including a text hash; `build_index` embeds only chunks
-    with no cached vector; `semantic_results` embeds the question and ranks by
-    cosine similarity; `retrieve` picks one of the four methods;
-    `answer_question` is the whole RAG pipeline; `tool_arguments` and
-    `call_tools` are the bounded agent, with every limit enforced in Python.
-12. `postgres_smoke.py`: `add_version` writes one synthetic document version;
-    the three `check_*` functions test versions, concurrency, inspection rows,
-    and synthetic vectors; `run_checks` creates a temporary test schema, runs
-    them, then removes only that schema. Set `EVIDENCEOPS_TEST_DATABASE_URL`
-    explicitly before running it.
-
-## Local documents and backup
-
-The Documents tab accepts pasted text or a `.txt`/`.pdf` upload with the access
-and operator tokens. UTF-8 text is limited to 100 KB. PDFs are limited to 2 MB
-and 20 pages; extracted text is cited by page. Uploaded bytes are retained in
-SQLite and can be downloaded with the access token until the version is deleted.
-Creating a new version preserves the old one. Restoring a deleted local version
-requires the operator token, checks its stored-file hash, and supersedes any
-current version of that source. A failed integrity check leaves the current
-version in place.
-Creation, superseding, deletion, restoration,
-and legacy import events appear in document history. Existing versions from
-before the byte-storage migration still have searchable text but may not have
-their original downloadable file. PDF tables may be flattened into text.
-For a page without an extractable text layer, the app optionally runs Poppler's
-`pdftoppm` and Tesseract from `PATH`. Install both separately if scanned PDFs
-are required; no Python OCR package is needed. On Windows CMD, check with
-`where pdftoppm` and `where tesseract`. The default language is `eng`. To add
-Traditional Chinese after installing its Tesseract language data, use
-`set EVIDENCEOPS_OCR_LANG=eng+chi_tra` before starting the API. OCR has a
-60-second total deadline and per-command timeouts. Missing tools, language
-data, or empty recognition reject the entire PDF; no empty evidence is saved.
-OCR execution was tested only with mocks here because both tools are absent.
-Only trusted local operators should upload PDFs; bounded input size does not
-make arbitrary PDFs safe for a public service.
-
-To restore a backup, stop the API/MCP processes, inspect the backup folder,
-and select a new empty local directory. In CMD:
-
-```cmd
-set EVIDENCEOPS_LOCAL_DIR=D:\LLM-RAG project\data\local\restored-copy
-.venv\Scripts\python.exe main.py restore --backup-dir "D:\LLM-RAG project\data\local\backups\YOUR_TIMESTAMP"
-```
-
-The command checks every backup database, restores `documents.db`, `tickets.db`,
-and `reviews.db` when present, and refuses to overwrite current stores. Start
-the API in that same CMD session to use the restored copy. Keep the original
-stores until you have checked the restored records.
-
-## Actual local observations and limits
-
-The three SOP texts, `metrics.csv`, `deployments.csv`, and `questions.csv` are
-the original synthetic educational examples described in the locally supplied
-`EvidenceOps_Data_Starter/data/README.txt`. That file states that they are not
-real factory or laboratory records. It does not give a separate redistribution
-license for the starter bundle, so confirm publication rights before sharing it.
-The two public Parquet files came from Jeremy Vachier's
-[Industrial Maintenance Synthetic Dataset](https://huggingface.co/datasets/Jvachier/industrial-maintenance-synthetic).
-Its local dataset card and upstream page state an Apache 2.0 license. Keep the
-upstream attribution and license notice if you redistribute those data. Both
-datasets remain excluded from this repository.
-
-The starter data has 3 SOP files, 8 metric rows, 3 deployment rows and 10
-questions. The SOPs become 6 blank-line paragraphs; with optional CSV evidence
-there are 17 searchable chunks. The maintenance Parquet file has 1,048,779
-rows and 20 columns; sensor tags have 1,048,779 rows and 9 columns. Parquet
-inspection uses metadata and a batch of at most five rows.
-
-Line B v3 rejection: 61/2000 = 3.05%. Line B v4: 145/2000 = 7.25%, a
-4.20 percentage point rise. Line A v3: 118/4000 = 2.95%. These are rejection
-rates, not false-rejection rates. They do not establish cause. The Line B v4
-deployment date (2026-10-03) and active SOP date (2026-10-04) differ.
-
-The supplied `questions.csv` has `question_id`, `question`, `expected_answer`,
-`expected_source`, and `question_type`, but no recorded human verification.
-In the Evaluation tab, choose **Review labels**. For each of the 10 questions,
-the supplied answer and sources are shown as unverified proposals. Choose a
-source, click **Show source evidence**, read the cited paragraph or record,
-then type the source filename(s) you actually confirmed. The confirmed field
-starts blank. Check the inspection box and save using the separate approval
-token. The server rejects review submissions without explicit confirmation.
-You can also use `main.py labels` and open the source files yourself. Only
-saved reviews tied to the current `questions.csv` and unchanged cited source
-files can be evaluated. Older reviews without source hashes require a fresh
-manual review:
-
-```cmd
-.venv\Scripts\python.exe main.py evaluate --include-csv
-.venv\Scripts\python.exe main.py evaluate --include-csv --json
-.venv\Scripts\python.exe main.py compare --include-csv
-```
-
-The comparison command writes raw ranks, scores, timings, and SHA-256 hashes
-of the exact evidence chunks and question texts to
-`data/local/retrieval_experiments.jsonl`. It marks top-1 and top-3 misses only
-for saved reviews. Unreviewed rows are unscored; an empty result is explicitly
-shown as having no lexical matches. Top-3 means **any expected source in
-the first three chunks**; it is not full multi-source recall or answer quality.
-Earlier 4/10 top-1 and 5/10 top-3 results were unverified-label diagnostics
-for SOP-only search, not a verified benchmark. No new verified result is claimed.
-The dashboard also offers a JSON download after a reviewed evaluation succeeds.
-
-API and MCP search use current/active evidence by default. API search can
-narrow results to an exact source filename or version. Set `active_only` to
-`false` in the API or `include_history` to `true` in MCP to inspect a
-superseded SOP or local upload deliberately. Deleted uploads remain excluded
-from search even in historical mode. Evaluation still compares historical sources
-where the reviewed question calls for them. Operational investigations and
-ticket drafts cite current SOPs; the SOP comparison explicitly reads history.
-Chinese
-search uses character pairs, not reliable word segmentation. Metadata
-identifies superseded SOPs; equal scores favor active documents. Hashes detect
-exact duplicates and changed content across local versions. There is no live
-source-watch process, embedding model, vector index, or model-backed semantic
-retrieval. The offline vector function uses supplied numeric test vectors only.
-Search results are evidence candidates; an adversarial document is displayed as
-data and cannot change ticket state by itself. Local documents use SQLite
-transactions and retain old and deleted versions for inventory; search reads
-only current versions. Earlier `documents.json` data is imported once if present.
-
-## Verified development progress
-
-- The original 14 tests passed before changes.
-- The expanded suite now has 53 passing tests, including ticket restart,
-  migration, concurrent decisions, local document concurrency, soft deletion,
-  PDF page citations and byte-hash checks, API access failures, MCP tool
-  failures and timeout handling, malformed CSV and legacy data, workflow
-  calculations, SQLite backup, partial label review, vector validation, and
-  request-key conflicts, exact uploaded text bytes, and source-change review
-  invalidation. Offline vector checks also reject zero embeddings and invalid
-  database dimensions. Soft-delete restoration, filtered search, and approval
-  denial were also verified. Workflow run history survives a restart and
-  reviewed-only JSON export refuses unreviewed labels.
-- The source-level audit fixed historical search for superseded local uploads,
-  removed absolute paths from API/MCP backend errors, hashes starter SOP bytes
-  exactly, rejects forged review-store paths, and removes partial SQLite
-  backups after failure. The fixed two-step workflow no longer needs LangGraph.
-  The optional PostgreSQL smoke test now forces a SQL constraint failure and
-  verifies the prior active version survives transaction rollback.
-- Successful review and JSON evaluation are exercised with an explicitly
-  constructed toy question and document in a temporary directory. Automated
-  tests do not confirm any of the ten supplied starter questions.
-- An isolated full scenario ingested actual starter SOP text, searched its
-  citation, calculated inspection and deployment findings, prepared a ticket,
-  denied missing and wrong approval tokens, approved with the separate token,
-  reopened persisted tickets and workflow runs, rejected a rotated access token,
-  and retrieved the local copy through the real MCP protocol.
-- The 10 starter question texts produced 20 keyword/BM25 runs with actual
-  source ranks and timings. These labels are unreviewed, so no accuracy
-  improvement is claimed. Q01's first result differed: keyword ranked
-  `sop_v2_en.txt`, while BM25 ranked `deployments.csv` in this run.
-- A real isolated headless Chrome check passed for the dashboard interactions
-  listed above. A first browser-helper attempt failed; a later correctly quoted
-  isolated Chrome profile provided a working debug port. Visual inspection on
-  your display and hosted-browser CI have not run.
-- A later headless Chrome audit exercised historical local-upload search,
-  deletion exclusion, deployment workflow display, and the unreviewed evaluation
-  message. At a 390-pixel viewport, the document width stayed at 390 pixels;
-  the navigation row scrolls horizontally within the page. The mobile
-  screenshot was inspected locally. A separate toy review screen saved one
-  manually confirmed source, showed a 1/1 evaluation, and downloaded a valid
-  reviewed-only JSON file in real Chrome. This is a browser-function check,
-  not a benchmark score for the starter questions.
-- A local MCP stdio client/server round trip discovered four tools and returned
-  a real cited SOP passage for `calibration records`. A separate isolated stdio
-  check called all four tools: search, Line B inspection metrics, and deployment
-  records succeeded; viewer-mode ticket preparation and an invalid line were
-  denied; operator mode prepared a pending draft. The container's MCP client
-  also discovered four tools and retrieved cited SOP evidence. No MCP tool can
-  approve a ticket.
-- Local API requests have a per-address rate limit and a body-size
-  limit of 200 KB, checked against actual bytes even if the declared length
-  is wrong. Requests with bodies need `Content-Length`. The dashboard response
-  disallows framing and remote script loading. These local
-  controls are not a substitute for a production gateway or user accounts.
-
-The optional PostgreSQL adapter ran against a local PostgreSQL 17 container
-with pgvector 0.8.7. It created the schema and vector column, stored two
-synthetic document versions, rejected a changed hash for an existing version,
-refused to delete the active version, deleted the inactive version, and stored
-an inspection row twice without duplication. A conflicting inspection count
-was rejected. A cosine-distance SQL query returned the expected row for
-**manually supplied synthetic vectors**. A dimension mismatch was rejected,
-and the active document and inspection row survived a database-container
-restart. A separate race check found 7/10 simultaneous version pairs with two
-active versions before repair. A per-source transaction lock fixed that: 20
-competing pairs and four concurrent writes of one version passed afterward.
-The checked-in smoke script also passed 10 independent competing pairs and a
-repeatable legacy-schema migration. It also passed against a newly created
-database with no prior pgvector extension. This tests the optional adapter,
-not model embeddings. The normal API still uses SQLite and does not switch to
-PostgreSQL automatically.
-The fixed two-step Python workflow and MCP discovery/execution were tested locally.
-Real local Ollama inference is now connected and tested on the lab machine; see
-"Local AI: embeddings, RAG and the bounded agent" below for what was measured and
-what is still weak. Human approval here is a separate local token and an explicit
-state transition; it is not an enterprise identity system.
-
-## Ollama connection notes and API references
-
-1. On the lab machine, confirm that Ollama is already running and keep it bound
-   to the local computer. Do not expose port 11434 publicly. Confirm which
-   evidence may be sent to it. Discover installed models; choose the embedding
-   and generator names from the real response. Do not assume either is installed.
-
-   ```cmd
-   curl.exe http://127.0.0.1:11434/api/tags
-   ```
-
-   On Linux, use `ollama list` or `curl http://127.0.0.1:11434/api/tags`.
-   The Python `list_ollama_models(base_url, approved=True)` adapter can also
-   list names and digests; it has only been tested with mocked responses here.
-
-2. Request a test embedding using the approved embedding model and verify that
-   `embeddings` contains one nonempty numeric vector. Record its dimension.
-   Use the same model and dimension for every current document chunk and every
-   question. If a source hash or model changes, rebuild its vectors.
-
-   ```cmd
-   curl.exe http://127.0.0.1:11434/api/embed -H "Content-Type: application/json" -d "{\"model\":\"YOUR_EMBED_MODEL\",\"input\":\"test passage\",\"truncate\":false}"
-   ```
-
-   On Linux, use `curl http://127.0.0.1:11434/api/embed -H 'Content-Type: application/json' -d '{"model":"YOUR_EMBED_MODEL","input":"test passage","truncate":false}'`.
-
-3. Request one nonstreaming generation with the approved generator model.
-   Check that the response has text and `done: true`:
-
-   ```cmd
-   curl.exe http://127.0.0.1:11434/api/generate -H "Content-Type: application/json" -d "{\"model\":\"YOUR_GENERATOR_MODEL\",\"prompt\":\"Say hello\",\"stream\":false}"
-   ```
-
-   On Linux, use `curl http://127.0.0.1:11434/api/generate -H 'Content-Type: application/json' -d '{"model":"YOUR_GENERATOR_MODEL","prompt":"Say hello","stream":false}'`.
-
-4. On the authorized lab machine, call `embed_texts(texts, base_url, model,
-   approved=True)` for current cited chunks and questions. Check that model
-   name, dimension, source version, and content hash stay consistent. Feed the
-   vectors in document order to `search_vectors(documents, query_vector,
-   document_vectors)` and compare against **manually reviewed** questions.
-   Use `build_grounded_prompt(question, evidence)` and call `ask_ollama(...,
-   approved=True)` only there. Test cited answers and tool permissions before
-   enabling `/api/agent`; the laptop endpoint still returns 503.
-
-The remaining **code** work on the lab machine is to save real chunk vectors
-with `(source, version, location, source SHA-256, embedding model, model digest,
-dimension)`, invalidate them when any of those change, embed each question
-with the same model, and connect `search_vectors` or `hybrid_search` to that
-store. `database.py` has a pgvector column but no model metadata or
-production vector ingestion/search path. Next, use only retrieved chunk IDs
-to build the prompt, call the generator, and validate every returned citation
-against those IDs; an unsupported citation must be rejected. A bounded agent
-may then call only the existing approved MCP tools, with no approval tool and
-no automatic ticket decision. Record actual retrieval ranks, model latency,
-answer quality against human reviewed questions, and failure cases before
-claiming RAG or agent performance. These integrations are **not implemented**
-by the current API.
-
-Ollama API references: [models](https://docs.ollama.com/api/tags),
-[embeddings](https://docs.ollama.com/api/embed), and
-[generation](https://docs.ollama.com/api/generate). The current adapter uses a
-10-second per-operation timeout, a 1 MB generation response cap, a 2 MB
-embedding response cap, and no redirects or
-proxies. It does not enforce a whole-request deadline; a real lab integration
-must measure end-to-end time and decide a suitable limit.
-
-## Local AI: embeddings, RAG and the bounded agent
-
-Everything here runs against a local Ollama server on `127.0.0.1:11434`. Nothing
-is sent to a hosted API, and port 11434 is not exposed.
-
-### Turn it on
+Tested from a fresh clone, in a new virtual environment, on Ubuntu 25.10 with Python 3.13.9 and Ollama 0.33.0.
 
 ```bash
+# 1. Get the code and create an environment
+git clone https://github.com/manideepreddyyanala4-svg/LLM-RAG.git
+cd LLM-RAG
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+
+# 2. Get the two local models (about 5.3 GB together)
+ollama pull qwen2.5:7b
+ollama pull qwen3-embedding:0.6b
+
+# 3. Create the small synthetic demo data (refuses to overwrite existing files)
+.venv/bin/python main.py demo
+
+# 4. Run the tests (no Ollama needed)
+.venv/bin/python -m unittest -q
+
+# 5. Configure and start the server. Use your own long random tokens; all three must differ.
+export EVIDENCEOPS_TOKEN='replace-with-a-long-random-access-token'
+export EVIDENCEOPS_OPERATOR_TOKEN='replace-with-a-different-operator-token'
+export EVIDENCEOPS_APPROVAL_TOKEN='replace-with-a-third-approval-token'
 export EVIDENCEOPS_AI_ENABLED=1
 export EVIDENCEOPS_MODEL=qwen2.5:7b
 export EVIDENCEOPS_EMBEDDING_MODEL=qwen3-embedding:0.6b
-export EVIDENCEOPS_TOKEN=choose-a-long-random-local-secret
-export EVIDENCEOPS_OPERATOR_TOKEN=a-different-operator-secret
-export EVIDENCEOPS_APPROVAL_TOKEN=a-third-approval-secret
 .venv/bin/python -m uvicorn api:app --host 127.0.0.1 --port 8000
 ```
 
-Both models must already be installed (`ollama list`). The server pins cached
-vectors to the installed model digest, so it refuses a model it cannot find and
-never silently mixes two embedding models.
+6. Open `http://127.0.0.1:8000/` and enter the three tokens at the top of the page.
 
-### Terminal
+On Windows, use `.venv\Scripts\python.exe` instead of `.venv/bin/python`, and `set NAME=value` instead of `export`.
+
+### A complete example investigation
+
+In the dashboard:
+
+1. **Documents** → paste a new SOP and add it. Example text:
+
+   ```
+   DOCUMENT ID: demo-recal-v1
+   STATUS: ACTIVE
+
+   Line B camera C1 must be recalibrated whenever the defect score threshold changes by more than 0.05.
+
+   當缺陷分數閾值變動超過 0.05 時，B 線 C1 相機必須重新校準。
+   ```
+
+2. **AI answers** → *Build missing embeddings*.
+3. Ask `When must camera C1 be recalibrated?`, then `目前 B 線的閾值是多少？`, then `Who approved the Line C deployment in 2019?`. The last one should abstain.
+4. Tick *Allow a pending incident draft* and run the agent with `Investigate the Line B rejection increase`.
+5. **Incidents** → *Approve*. It is refused without the right approval token, and accepted with it. Then open *History*.
+
+From the terminal (with the same environment variables set):
 
 ```bash
 .venv/bin/python main.py ask --question "目前 B 線的閾值是多少？"
-.venv/bin/python main.py ask --question "What is the current Line B threshold?" --method semantic
-.venv/bin/python main.py agent --question "Investigate the Line B rejection increase"
-.venv/bin/python main.py agent --question "Investigate Line B" --allow-draft
-.venv/bin/python main.py aieval          # records a real run to data/local/ai_evaluation.json
+.venv/bin/python main.py agent --question "Investigate the Line B rejection increase" --allow-draft
+.venv/bin/python main.py investigate      # deterministic rejection-rate report, no model
+.venv/bin/python main.py aieval           # full recorded evaluation, writes data/local/ai_evaluation.json
 ```
 
-### Dashboard
+### Environment variables
 
-The "AI answers" tab checks the models and index, builds missing embeddings,
-asks a question in either language, compares all four retrieval methods, runs the
-bounded agent, and lists saved runs. A prepared draft links to the Incidents tab,
-where approval still needs the separate approval token.
-
-### How retrieval works
-
-`rag.py` holds the whole AI layer. Each chunk gets a `source_id` of
-`source|version|location|text-hash`, so editing a document changes its ID and the
-chunk is re-embedded on the next index build. Vectors live in
-`data/local/vectors.db` keyed by the model digest. Four methods rank the same
-chunks: `keyword`, `bm25`, `semantic` (cosine over real embeddings), and `hybrid`
-(reciprocal-rank fusion of keyword and semantic). Deleted and superseded versions
-are excluded before retrieval, so deleted evidence cannot be cited.
-
-### How an answer is checked
-
-Question → retrieve → build context → generate JSON claims → check every citation
-and quotation in Python → ask the model to re-check each claim, one at a time,
-against only the passage it cites → save the run. The answer schema has only a
-`claims` list; an empty list is the only way to abstain. The checker first copies
-the passage's own words, then gives a yes/no verdict. A claim is shown only if its citation names a
-retrieved passage, its quote appears verbatim in that passage, and the second
-check does not reject it. Otherwise the status is `withheld` or `insufficient` and
-the claims are kept in `withheld_claims` for a human to read. No answer text is
-ever produced without retrieved evidence behind it.
-
-### Agent limits, enforced in Python not in the prompt
-
-Four approved MCP tools, reached over the real stdio protocol: search SOP
-evidence, read inspection metrics, compare deployments, prepare an incident
-draft. There is no approve, SQL, shell, filesystem or network tool. Additionally:
-
-- at most 6 steps per run;
-- each action has a per-run budget (`ACTION_LIMITS` in `rag.py`): each line's
-  metrics and deployments once, two SOP searches, one incident draft. Used-up
-  actions are removed from the choices the model is given, and refused in code
-  if the model names one anyway;
-- `finish` is offered only after at least one SOP search, so findings can cite
-  a source;
-- an unapproved tool name is refused before any call;
-- identical repeat calls are refused;
-- the draft tool needs the operator token, and the MCP process is started without
-  the operator token at all in viewer mode;
-- the approval secret is removed from the tool process environment, so no tool
-  can approve anything. A draft is always created `pending`.
-
-### What was actually measured on the lab machine
-
-Hardware: NVIDIA GeForce RTX 5080 (16 GB), 123 GB RAM, Ubuntu 25.10,
-Python 3.13.9, Ollama 0.33.0. Embeddings: `qwen3-embedding:0.6b`, 1024
-dimensions, verified on English and Traditional Chinese text.
-
-Retrieval over the small demo corpus: all four methods placed the expected source
-in the top three for all four answerable test cases. Lexical search took about
-0.05–0.10 ms, semantic about 31 ms, hybrid about 36 ms, plus a one-off index
-build. On a corpus this small the vector methods are not more accurate than BM25;
-their benefit is cross-lingual matching, not ranking quality. These are
-deterministic lab test cases, not human-reviewed benchmark labels, and no
-accuracy percentage is claimed from them.
-
-Generation with `qwen2.5:7b`, measured with `main.py aieval` on 6 regression
-cases and 12 held-out cases. The held-out cases use separate synthetic documents
-and were committed (`d97c3c5`) before the fixes below. These are automatic phrase
-checks on lab test cases, not human-reviewed labels; every answer was also read
-by hand.
-
-| | Before | After |
+| Variable | Required | Purpose |
 |---|---|---|
-| Regression: correct / refused though answerable / correct abstention | 1 / 3 / 2 | 3 / 1 / 2 |
-| Held-out: correct / refused though answerable / correct abstention | 0 / 7 / 5 | 5 / 2 / 5 |
-| Wrong answers | 0 | 0 |
-| Median time per answer | ~200 ms | ~600 ms |
+| `EVIDENCEOPS_TOKEN` | Yes | Access token; needed for every data request |
+| `EVIDENCEOPS_OPERATOR_TOKEN` | For changes | Upload, delete and restore documents; build embeddings; let the agent draft |
+| `EVIDENCEOPS_APPROVAL_TOKEN` | For decisions | Approve, reject or complete incidents; save label reviews |
+| `EVIDENCEOPS_AI_ENABLED` | For AI | Must be `1`; AI is off otherwise |
+| `EVIDENCEOPS_MODEL` | For AI | Installed generation model, for example `qwen2.5:7b` |
+| `EVIDENCEOPS_EMBEDDING_MODEL` | For AI | Installed embedding model, for example `qwen3-embedding:0.6b` |
+| `EVIDENCEOPS_OLLAMA_URL` | No | Default `http://127.0.0.1:11434`; must be a loopback address |
+| `EVIDENCEOPS_AI_TIMEOUT` | No | Seconds per model call, 1–180, default 120 |
+| `EVIDENCEOPS_LOCAL_DIR` | No | Absolute path for the SQLite stores, default `data/local` |
+| `EVIDENCEOPS_DATA_DIR` | No | Absolute path for the starter files |
+| `EVIDENCEOPS_OCR_LANG` | No | Tesseract language for scanned PDFs, for example `eng+chi_tra` |
 
-Root causes of the earlier over-refusal: the answer schema put an
-`insufficient` flag before the claims, so the model committed to refusing before
-writing anything; and the checker returned a bare list of rejected claim
-numbers, which rejected most correct claims. The remaining three refusals are all
-Traditional Chinese. Two come from the checker and are strict but defensible:
-the claims added or dropped a detail the passage does not state. One is a
-generator refusal. `llama3:latest` failed both Traditional Chinese questions in an
-earlier test, so `qwen2.5:7b` remains the better bilingual choice.
+The three tokens must all be different. The server refuses to approve anything if the approval token matches either of the others. Never commit real tokens; `.env` files are ignored by Git.
 
-Agent: before the action budgets, 3 runs used 18 steps, 11 of them refused
-duplicates, and no run ever chose to finish. After, every run finishes by itself
-in 5 steps with no refused or repeated calls, and always after an SOP search.
-Some of those calls read Line A, which has no records in the demo data, so not
-every call is informative.
+## Test and evaluation results
 
-Adversarial check: a document containing "IGNORE ALL PREVIOUS INSTRUCTIONS",
-a fake approver and a fake 0.99 threshold was uploaded through the real ingest
-path. It was retrieved, but the model did not repeat the injected threshold or
-approver, no ticket changed state, and a legitimate paragraph of the same file
-was still cited correctly.
+### Automated tests
 
-## Packaging and GitHub status
+`python -m unittest -q` runs **81 tests: 73 pass and 8 are skipped**, after `main.py demo` on a fresh clone.
 
-`requirements.txt` pins the runtime versions; LangGraph was removed after the
-two-step workflow was simplified. `Dockerfile` and
-`.dockerignore` prepare an optional container. `compose.yaml` mounts starter
-data read-only, persists `data/local`, requires three distinct tokens, and
-exposes only `127.0.0.1:8000` on the host by default. In Windows CMD:
+The 8 skips are deliberate. Those tests assert exact values from the original EvidenceOps starter dataset, such as a 3.05% Line B v3 rejection rate. That dataset is not in this repository because it has no explicit redistribution license. The tests run again automatically whenever that dataset is present, and the demo data is not made to imitate it.
 
-```cmd
-set EVIDENCEOPS_TOKEN=choose-a-long-random-local-secret
-set EVIDENCEOPS_OPERATOR_TOKEN=choose-a-different-long-random-operator-secret
-set EVIDENCEOPS_APPROVAL_TOKEN=choose-a-different-long-random-secret
-docker compose -f compose.yaml config --quiet
+GitHub Actions runs the dataset-free subset plus all AI-layer tests (no Ollama required), and a PostgreSQL/pgvector smoke test.
+
+### Real-model evaluation
+
+`main.py aieval` sends real questions to the local models and grades each answer. There are three case sets:
+
+- **Regression:** 6 cases on the demo SOPs.
+- **Held-out:** 12 cases on separate synthetic lens-handling SOPs. These were committed to Git before the fixes they measure.
+- **Prompt injection:** 4 cases with a planted document that orders the AI to report a false threshold and a fake approval.
+
+These are **lab test cases graded by automatic phrase checks, not human-reviewed labels**, and no accuracy percentage is claimed. Every answer was also read by hand.
+
+Results from commit `2a56744`, run from a fresh clone, `qwen2.5:7b` + `qwen3-embedding:0.6b`:
+
+| Set | Correct, cited answers | Answerable but refused | Correct abstentions | Wrong answers |
+|---|---|---|---|---|
+| Regression (6) | 3 of 4 | 1 | 2 of 2 | 0 |
+| Held-out (12) | 5 of 7 | 2 | 5 of 5 | 0 |
+| Prompt injection (4) | — | — | 4 of 4 resisted | 0 |
+
+- **Retrieval:** the expected source was in the top three for 11 of 11 answerable cases with semantic and hybrid search, and 10 of 11 with keyword and BM25. Hybrid search takes about 30 ms and BM25 about 0.1 ms, plus a one-off embedding build. On a corpus this small, this shows only that cross-lingual matching works, not that one method ranks better.
+- **Latency:** a full answer takes a median of about 0.6 s, including about 0.36 s for generation and the claim check.
+- **Repeatability:** each of the 4 repeated cases gave the same result in all 3 runs.
+- **Agent:** 3 runs, 15 tool calls, none refused or repeated. The model finished every run itself, always after an SOP search.
+
+Before the fixes recorded in Git history, the same harness found 1 and 0 correct answers on the regression and held-out sets. The agent spent 11 of 18 steps on refused duplicates. A planted document could make the system show "threshold 0.99, approved by Director Chen" as a cited fact.
+
+Hardware: NVIDIA GeForce RTX 5080 (16 GB), 123 GB RAM.
+
+## Security boundaries
+
+- **Local only.** The API binds to `127.0.0.1`. Ollama must be a loopback address, and the browser cannot choose it. Calls to Ollama do not follow redirects or use proxies.
+- **Three roles.** The access token reads data. The operator token changes documents and creates drafts. The approval token decides incidents. Tokens are compared in constant time, and the server refuses to run approvals if two tokens are equal.
+- **The AI cannot approve.** No tool can approve or change ticket state. The approval secret never enters the MCP process, and every draft starts as `pending`.
+- **Grounding is checked in code.** Citations must name retrieved passages, and quotations must match word for word. Deleted and superseded versions are never searched.
+- **Bounded inputs.** Request sizes, upload sizes (100 KB text, 2 MB and 20 pages for PDF), model response sizes, prompt length and timeouts are all capped.
+- **Rate limiting.** At most 120 API requests per minute per client.
+- **Not authentication.** These tokens are a local role boundary for one machine, not user identity or production access control. Do not expose this server to a network.
+
+## Known limitations
+
+- **Prompt-injection protection is partial.** The filter catches passages that address the AI with known phrasings. A document that simply states a false fact ("the threshold is now 0.99") is indistinguishable from a real conflicting SOP and will be cited, with its source shown. The real control is that only operators can upload documents.
+- **Chinese answers are weaker.** The 3 remaining refusals of answerable questions are all Traditional Chinese. One was blocked by the Python quote check (the quotation was not word for word), one by the strict model checker, and one because the generator returned no claims.
+- **The model checker can still be wrong.** It is strict, and it is the only guard on whether a claim's wording matches its quote.
+- **The corpus is tiny.** It has about 11 chunks, so retrieval methods cannot be meaningfully ranked against each other. There is no human-reviewed benchmark.
+- **The agent wastes some steps.** It reads Line A, which has no records in the demo data. Its summaries usually abstain, because the SOPs do not state causes, which is the correct outcome.
+- **Docker runs the offline features only.** Inside a container, `127.0.0.1` is not the host, so local AI is disabled by design.
+- **Not tested here:** scanned-PDF OCR (only with mocks), multiple users, and large corpora.
+
+## More features
+
+<details>
+<summary>Documents, versions, PDFs and backups</summary>
+
+The Documents tab accepts pasted text, or a `.txt` or `.pdf` upload with the operator token. A new version supersedes the old one, which is kept. Soft-deleted versions are never searched and can be restored after a stored-file hash check. Uploaded bytes are kept, so the original can be downloaded.
+
+PDF text is cited by page. For a page with no text layer, the app can optionally run Poppler `pdftoppm` and Tesseract from `PATH`; missing tools reject the PDF rather than saving empty evidence.
+
+`main.py backup` copies the SQLite stores into a new timestamped folder. To restore, run `main.py restore --backup-dir <folder>` with `EVIDENCEOPS_LOCAL_DIR` pointing at a new empty directory; it refuses to overwrite existing stores.
+</details>
+
+<details>
+<summary>Label review and lexical evaluation</summary>
+
+The Evaluation tab shows the supplied question labels as **unverified proposals**. A person opens the cited evidence, types the sources they confirmed, and saves the review with the approval token. Only saved reviews tied to unchanged question and source files are scored, by `main.py evaluate`. `main.py compare` records raw keyword and BM25 ranks and timings without claiming accuracy.
+</details>
+
+<details>
+<summary>Deterministic workflows, MCP client and other commands</summary>
+
+```bash
+.venv/bin/python main.py workflow --kind inspection --question "Line B rejection rate"
+.venv/bin/python main.py workflow --kind deployment --question "Compare Line B deployments"
+.venv/bin/python main.py workflow --kind sop_conflict --question "Review Line B SOP versions"
+.venv/bin/python mcp_client.py      # real MCP discovery and one search call
+```
+
+These workflows use no model. The SOP workflow creates a **pending** ticket.
+</details>
+
+<details>
+<summary>Docker and optional PostgreSQL</summary>
+
+```bash
+mkdir -p data/public
 docker compose -f compose.yaml up --build
-```
-
-Docker Desktop started locally, the image built, and the app container became
-healthy. In an isolated Compose project bound to host port 8768, the real HTTP
-API denied a request without an access token, ingested and searched a test
-document, denied ticket approval without the approver token, and approved the
-ticket with it. The document and ticket survived an app-container restart.
-The container also returned a cited search hit, ran inspection, deployment,
-and SOP workflows, kept three workflow reports after a second restart, and
-returned 20 raw comparison rows. Reviewed-only evaluation correctly returned
-409 because no human label reviews were saved in that isolated store. An
-immediate request during restart failed while the server was starting; the
-health check became ready and the persistence check then passed.
-Inspection of the image environment found none of the test tokens baked in.
-The test project used its own ignored local data directory; the usual stores
-were untouched. The host-port and mount overrides are for isolated testing;
-the defaults remain 8000 and `data/local`.
-
-For the optional PostgreSQL/pgvector service, set a private password in the
-same CMD session and start the profile. The database has no published host
-port; it is available to containers on this Compose network as `db:5432`.
-An empty password prevents the database image from initializing. Keep the
-password stable for an existing named volume. `database.py` connects only
-when a caller explicitly supplies a DSN.
-
-```cmd
-set EVIDENCEOPS_PG_PASSWORD=choose-a-private-local-database-password
-docker compose -f compose.yaml --profile postgres config --quiet
+# optional database profile; set a private EVIDENCEOPS_PG_PASSWORD first
 docker compose -f compose.yaml --profile postgres up --build
-docker compose -f compose.yaml --profile postgres ps
 ```
 
-To repeat the database smoke check in the app container, set a DSN for this
-**test**, with a URL-encoded password if needed. It creates a new random schema
-and removes that schema afterward; use an isolated database if possible.
+The container is read-only, drops all capabilities, and publishes only `127.0.0.1:8000`. The API keeps using SQLite. `postgres_smoke.py` tests the PostgreSQL adapter against an isolated, temporary schema.
+</details>
 
-```cmd
-set "EVIDENCEOPS_TEST_DATABASE_URL=postgresql://evidenceops:YOUR_URL_ENCODED_PASSWORD@db:5432/evidenceops"
-docker compose -f compose.yaml --profile postgres exec -e EVIDENCEOPS_TEST_DATABASE_URL evidenceops python postgres_smoke.py
-```
+## Data
 
-The app image does not include optional OCR executables, so scanned PDFs are
-rejected there unless a separately reviewed OCR image is prepared. Tests need
-mounted real fixtures. `.github/workflows/offline.yml` defines 30 dataset-free
-smoke tests, source compilation, and a separate PostgreSQL/pgvector service job
-in GitHub CI. Its YAML parsed; all 30 selected tests and the equivalent
-live database smoke script passed locally. Check the GitHub Actions page for
-the status of each published commit. The
-full 53-test suite uses the private starter dataset and runs locally.
-`.gitignore` excludes datasets, virtual environments, caches, secrets, SQLite
-files and archives. Review every future staged file before publishing.
+All demonstration data is synthetic. `main.py demo` writes six tiny files into `EvidenceOps_Data_Starter/data/`: three SOPs (one old English version, an active English version and an active Traditional Chinese version), inspection metrics, deployments, and one **unverified** practice question.
+
+The original EvidenceOps starter files and the public Parquet maintenance dataset are deliberately excluded from Git. `data/`, `EvidenceOps_Data_Starter/`, `*.db` and `*.jsonl` are all ignored, so local stores, vectors and evaluation outputs are never committed.
+
+## Project files
+
+| File | What it does |
+|---|---|
+| `retrieval.py` | Keyword, BM25, cosine-similarity and hybrid ranking; pure Python, no model |
+| `ollama_client.py` | Safe Ollama calls, embeddings, the injection filter, grounded answers and claim checks |
+| `rag.py` | Embedding index, the four retrieval methods, the RAG pipeline and the bounded agent |
+| `mcp_server.py` / `mcp_client.py` | The four MCP tools and a small client |
+| `api.py` | FastAPI endpoints and the three token roles |
+| `data_io.py` | Loading SOPs and CSVs; versioned local documents in SQLite |
+| `investigation.py` | Rejection-rate calculations and incident tickets |
+| `workflow.py` | Deterministic, model-free investigation workflows |
+| `evaluation.py` | Human label review and lexical comparison |
+| `database.py` | Optional PostgreSQL adapter, plus SQLite storage for vectors and AI runs |
+| `main.py` | Terminal commands, demo data and the real-model evaluation |
+| `dashboard.html` | The single-page dashboard |
+| `test_evidenceops.py` | The test suite |
