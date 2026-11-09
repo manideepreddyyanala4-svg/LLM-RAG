@@ -1,0 +1,42 @@
+services:
+  evidenceops:
+    build: .
+    ports:
+      - "127.0.0.1:${EVIDENCEOPS_HOST_PORT:-8000}:8000"
+    environment:
+      EVIDENCEOPS_TOKEN: ${EVIDENCEOPS_TOKEN:?Set a local access token}
+      EVIDENCEOPS_OPERATOR_TOKEN: ${EVIDENCEOPS_OPERATOR_TOKEN:?Set a separate operator token}
+      EVIDENCEOPS_APPROVAL_TOKEN: ${EVIDENCEOPS_APPROVAL_TOKEN:?Set a separate approval token}
+      EVIDENCEOPS_LOCAL_DIR: /app/data/local
+    volumes:
+      - ./EvidenceOps_Data_Starter/data:/app/EvidenceOps_Data_Starter/data:ro
+      - ./data/public:/app/data/public:ro
+      - ${EVIDENCEOPS_LOCAL_MOUNT:-./data/local}:/app/data/local
+    read_only: true
+    init: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+  db:
+    profiles:
+      - postgres
+    image: pgvector/pgvector:0.8.7-pg17
+    environment:
+      POSTGRES_USER: evidenceops
+      POSTGRES_DB: evidenceops
+      POSTGRES_PASSWORD: ${EVIDENCEOPS_PG_PASSWORD:-}
+    volumes:
+      - evidenceops_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U evidenceops -d evidenceops"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  evidenceops_pg_data:

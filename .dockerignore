@@ -1,0 +1,12 @@
+.venv/
+data/
+EvidenceOps_Data_Starter/
+__pycache__/
+*.pyc
+.git/
+.env*
+*.pem
+*.key
+*.zip
+*.log
+*.jsonl
