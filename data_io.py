@@ -17,7 +17,9 @@ from pypdf import PdfReader
 from pypdf.errors import PyPdfError
 
 ROOT = Path(__file__).resolve().parent
-DATA = ROOT / "EvidenceOps_Data_Starter" / "data"
+DATA = Path(os.environ.get("EVIDENCEOPS_DATA_DIR", ROOT / "EvidenceOps_Data_Starter" / "data"))
+if not DATA.is_absolute():
+    raise ValueError("EVIDENCEOPS_DATA_DIR must be an absolute path")
 configured_local = os.environ.get("EVIDENCEOPS_LOCAL_DIR")
 LOCAL = Path(configured_local) if configured_local else ROOT / "data" / "local"
 if not LOCAL.is_absolute():
@@ -50,8 +52,9 @@ def read_csv(path, required):
     return rows
 
 
-def load_documents(folder=DATA, include_csv=False, local_file=None, include_deleted=False):
+def load_documents(folder=None, include_csv=False, local_file=None, include_deleted=False):
     """Return source, location and text dictionaries for SOPs and optional CSVs."""
+    folder = DATA if folder is None else folder
     documents = []
     if not folder.is_dir():
         raise FileNotFoundError(f"Evidence folder missing: {folder}")
@@ -72,12 +75,14 @@ def load_documents(folder=DATA, include_csv=False, local_file=None, include_dele
     if include_csv:
         # Questions and expected answers must never become searchable evidence.
         for name in ("metrics.csv", "deployments.csv"):
+            digest = hashlib.sha256((folder / name).read_bytes()).hexdigest()
             for number, row in enumerate(read_csv(folder / name, ["date", "line", "model"]), 1):
                 fields = []
                 for key, value in row.items():
                     fields.append(f"{key}: {value}")
                 documents.append(dict(source=name, location=f"record {number}",
-                                      text="; ".join(fields)))
+                                      text="; ".join(fields), hash=digest, version=digest[:12],
+                                      line=row["line"], record_model=row["model"]))
     return documents
 
 

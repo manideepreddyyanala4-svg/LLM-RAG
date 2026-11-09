@@ -3,7 +3,10 @@ import argparse
 import json
 import sqlite3
 import sys
-from datetime import datetime
+import platform
+import shutil
+import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from data_io import DATA, ROOT, LOCAL, backup_local_databases, restore_local_databases, inspect_parquet, load_documents, read_csv
 from retrieval import search_documents, current_evidence
@@ -32,16 +35,151 @@ def create_demo_data(folder):
     return len(files)
 
 
+def print_answer(result):
+    """Print the generated answer with its checked citations and real timings."""
+    print("Status:", result["status"])
+    print("Answer:", result["answer"])
+    for claim in result["claims"]:
+        print(f"  claim [{claim['citation']}] {claim['text']}")
+        print(f"    verified quote: {claim['quote']}")
+    for claim in result.get("withheld_claims", []):
+        print(f"  WITHHELD [{claim['citation']}] {claim['text']}")
+    if result["citation_errors"]:
+        print("Citation problems:", "; ".join(result["citation_errors"]))
+    if result["unsupported_claims"]:
+        print("Claims the checker rejected:", result["unsupported_claims"])
+    print("Evidence used:")
+    for row in result["evidence"]:
+        print(f"  [{row['citation_id']}] {row['source']} {row['location']} ({row.get('version')})")
+    print(f"Timings ms: retrieval={result.get('retrieval_ms')} index={result.get('index_ms')} "
+          f"generation={result['inference_ms']} citation_check={result['verification_ms']}")
+    print("Generation model:", result["model"], "| embedding model:", result.get("embedding_model"),
+          "| dimensions:", result.get("dimensions"))
+    print("Note:", result["verification"])
+
+
+# Deterministic test cases written for this lab. These are NOT human-reviewed
+# benchmark labels: each one only names evidence that is present in the files.
+AI_TEST_CASES = [
+    {"id": "EN-THRESHOLD", "question": "What is the current Line B threshold?",
+     "expect_source": "sop_v2_en.txt", "language": "English"},
+    {"id": "ZH-THRESHOLD", "question": "目前 B 線的閾值是多少？",
+     "expect_source": "sop_v2_zh.txt", "language": "Traditional Chinese"},
+    {"id": "EN-CALIBRATION", "question": "What must be checked before changing settings?",
+     "expect_source": "sop_v2_en.txt", "language": "English"},
+    {"id": "ZH-CALIBRATION", "question": "更改設定前需要檢查什麼？",
+     "expect_source": "sop_v2_zh.txt", "language": "Traditional Chinese"},
+    {"id": "EN-ABSENT", "question": "Who approved the Line C deployment in 2019?",
+     "expect_source": None, "language": "English"},
+    {"id": "ZH-ABSENT", "question": "C 線在 2019 年由誰核准部署？",
+     "expect_source": None, "language": "Traditional Chinese"},
+]
+
+
+def hardware_facts():
+    """Record the lab machine and GPU only from what the system actually reports."""
+    facts = {"platform": platform.platform(), "python": platform.python_version()}
+    try:
+        facts["total_ram_kb"] = int(Path("/proc/meminfo").read_text().split()[1])
+    except (OSError, ValueError, IndexError):
+        facts["total_ram_kb"] = None
+    gpu = shutil.which("nvidia-smi")
+    facts["gpu"] = None
+    if gpu:
+        try:
+            probe = subprocess.run([gpu, "--query-gpu=name,memory.total,driver_version",
+                                    "--format=csv,noheader"], capture_output=True, timeout=15)
+            if probe.returncode == 0:
+                facts["gpu"] = probe.stdout.decode("utf-8", errors="replace").strip()
+        except (OSError, subprocess.TimeoutExpired):
+            facts["gpu"] = None
+    return facts
+
+
+def run_ai_evaluation():
+    """Run every method and every test case against the real local models."""
+    from rag import answer_question, compare_methods, run_agent, ai_status, evidence_documents
+    report = {"recorded_at_utc": datetime.now(timezone.utc).isoformat(),
+              "hardware": hardware_facts(), "ai_status": ai_status(),
+              "labels": "Deterministic lab test cases. Not human-reviewed benchmark labels. "
+                        "expect_source only records which file holds the evidence.",
+              "retrieval": [], "answers": [], "agent": None, "errors": []}
+    documents = evidence_documents()
+    for case in AI_TEST_CASES:
+        try:
+            comparison = compare_methods(case["question"], documents)
+        except (RuntimeError, ValueError, OSError) as error:
+            report["errors"].append({"case": case["id"], "stage": "retrieval", "error": str(error)})
+            continue
+        for row in comparison["comparison"]:
+            sources = [hit["source"] for hit in row["ranking"]]
+            found = None
+            if case["expect_source"]:
+                found = case["expect_source"] in sources
+            report["retrieval"].append({
+                "case": case["id"], "language": case["language"], "method": row["method"],
+                "ranked_sources": sources, "source_ids": row["source_ids"],
+                "expected_source_in_top3": found, "retrieval_ms": row["retrieval_ms"],
+                "index_ms": row["index_ms"]})
+    for case in AI_TEST_CASES:
+        try:
+            answer = answer_question(case["question"], "hybrid")
+        except (RuntimeError, ValueError, OSError) as error:
+            report["errors"].append({"case": case["id"], "stage": "generation", "error": str(error)})
+            continue
+        report["answers"].append({
+            "case": case["id"], "language": case["language"], "question": case["question"],
+            "status": answer["status"], "answer": answer["answer"],
+            "claims": answer["claims"], "withheld_claims": answer.get("withheld_claims", []),
+            "cited_source_ids": [row.get("source_id") for row in answer["evidence"]],
+            "citation_errors": answer["citation_errors"],
+            "unsupported_claims": answer["unsupported_claims"],
+            "evidence_sufficient": answer["status"] != "insufficient",
+            "expected_evidence_present": case["expect_source"] is not None,
+            "inference_ms": answer["inference_ms"], "verification_ms": answer["verification_ms"],
+            "retrieval_ms": answer["retrieval_ms"], "run_id": answer["run_id"]})
+    report["repeatability"] = []
+    for case in AI_TEST_CASES[:4]:
+        statuses = []
+        for _ in range(3):
+            try:
+                statuses.append(answer_question(case["question"], "hybrid")["status"])
+            except (RuntimeError, ValueError, OSError) as error:
+                statuses.append(f"error: {error}")
+        report["repeatability"].append({"case": case["id"], "runs": 3, "statuses": statuses,
+                                        "identical": len(set(statuses)) == 1})
+    try:
+        agent = run_agent("Investigate the Line B rejection increase against the SOP", False)
+        report["agent"] = {"steps_used": agent["steps_used"], "step_limit": agent["step_limit"],
+                           "stopped_because": agent["stopped_because"],
+                           "tools_approved": agent["tools_approved"],
+                           "calls": [{"tool": step["tool"], "arguments": step["arguments"],
+                                      "ok": step["ok"],
+                                      "output": str(step["output"])[:300]} for step in agent["steps"]],
+                           "draft_created": agent["ticket"], "summary_status": agent["status"],
+                           "planning_ms": agent["planning_ms"]}
+    except (RuntimeError, ValueError, OSError) as error:
+        report["errors"].append({"case": "agent", "stage": "agent", "error": str(error)})
+    LOCAL.mkdir(parents=True, exist_ok=True)
+    (LOCAL / "ai_evaluation.json").write_text(json.dumps(report, ensure_ascii=False, indent=2),
+                                              encoding="utf-8")
+    return report
+
+
 def main():
     """Read command options, load evidence and run the selected offline action."""
     parser = argparse.ArgumentParser(description="EvidenceOps laptop Version 1")
     parser.add_argument("action", nargs="?", default="search",
                         choices=["search", "inspect", "labels", "evaluate", "investigate", "compare", "demo",
-                                 "workflow", "backup", "restore"])
+                                 "workflow", "backup", "restore", "ask", "agent", "aieval"])
     parser.add_argument("--question", help="Ask once instead of opening the question loop")
     parser.add_argument("--kind", choices=["inspection", "deployment", "sop_conflict"],
                         default="inspection", help="Choose a deterministic workflow")
     parser.add_argument("--include-csv", action="store_true", help="Search CSV records too")
+    parser.add_argument("--method", choices=["keyword", "bm25", "semantic", "hybrid"], default="hybrid",
+                        help="Retrieval method for the ask action")
+    parser.add_argument("--allow-draft", action="store_true",
+                        help="Let the agent prepare a pending incident draft")
     parser.add_argument("--json", action="store_true", help="Print a reviewed evaluation as JSON")
     parser.add_argument("--backup-dir", help="Existing backup directory for a non-overwriting restore")
     parser.add_argument("--labels-verified", action="store_true",
@@ -52,6 +190,29 @@ def main():
             count = create_demo_data(DATA)
             print(f"Created {count} explicitly synthetic example files in {DATA}")
             print("The example question label has not been human verified.")
+            return 0
+        if args.action in ("ask", "agent", "aieval"):
+            from rag import answer_question, run_agent
+            if args.action == "ask":
+                question = args.question or input("Question: ")
+                print_answer(answer_question(question, args.method))
+                return 0
+            if args.action == "agent":
+                request = args.question or input("Investigation request: ")
+                result = run_agent(request, args.allow_draft)
+                print(f"Steps used: {result['steps_used']} of {result['step_limit']} "
+                      f"({result['stopped_because']})")
+                for number, step in enumerate(result["steps"], 1):
+                    state = "ok" if step["ok"] else "refused/failed"
+                    print(f"  {number}. {step['tool']} {json.dumps(step['arguments'], ensure_ascii=False)} -> {state}")
+                    print("     ", json.dumps(step["output"], ensure_ascii=False)[:300])
+                if result["ticket"]:
+                    print("Pending draft:", result["ticket"], "(a human must approve it)")
+                print_answer(result)
+                return 0
+            report = run_ai_evaluation()
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            print("\nSaved to:", LOCAL / "ai_evaluation.json")
             return 0
         if args.action == "inspect":
             inspect_parquet(ROOT / "data" / "public")

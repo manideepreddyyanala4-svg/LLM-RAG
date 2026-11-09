@@ -193,11 +193,20 @@ Read in this order:
    versioned documents, chunks, inspection rows and inactive-version deletion.
    `setup_vectors(dsn, dimensions)` requires an available pgvector extension
    and a real embedding dimension. Nothing connects without an explicit DSN.
-10. `ollama_client.py`: `list_ollama_models`, `ask_ollama`, and `embed_texts` require explicit approval
-    for later lab requests; `build_grounded_prompt` formats real citations
-    without calling a model. The current UI and API do not call a model.
-    `test_evidenceops.py` checks the offline behavior.
-11. `postgres_smoke.py`: `add_version` writes one synthetic document version;
+10. `ollama_client.py`: the local model adapter. `list_ollama_models`,
+    `ask_ollama` and `embed_texts` require an explicitly approved loopback
+    endpoint and validate every vector they get back. `ai_settings` reads the
+    server-side choices, `installed_model` pins a model digest, `chat_ollama`
+    makes one bounded call, and `grounded_answer` generates claims then checks
+    each citation and quotation. `check_claims` is the pure-Python part of that
+    check, so read it before the model-based one.
+11. `rag.py`: the AI layer that ties the rest together. `source_id` gives each
+    chunk a stable ID including a text hash; `build_index` embeds only chunks
+    with no cached vector; `semantic_results` embeds the question and ranks by
+    cosine similarity; `retrieve` picks one of the four methods;
+    `answer_question` is the whole RAG pipeline; `tool_arguments` and
+    `call_tools` are the bounded agent, with every limit enforced in Python.
+12. `postgres_smoke.py`: `add_version` writes one synthetic document version;
     the three `check_*` functions test versions, concurrency, inspection rows,
     and synthetic vectors; `run_checks` creates a temporary test schema, runs
     them, then removes only that schema. Set `EVIDENCEOPS_TEST_DATABASE_URL`
@@ -386,14 +395,12 @@ database with no prior pgvector extension. This tests the optional adapter,
 not model embeddings. The normal API still uses SQLite and does not switch to
 PostgreSQL automatically.
 The fixed two-step Python workflow and MCP discovery/execution were tested locally.
-The AI agent endpoint returns 503 until real model inference is connected.
-No live Ollama request, real embeddings, model-backed retrieval, agent
-reasoning, or lab integration has been tested. Ollama generation and embedding
-response validation was tested with mocked HTTP responses only. Human approval
-here is a separate local token and
-an explicit state transition; it is not an enterprise identity system.
+Real local Ollama inference is now connected and tested on the lab machine; see
+"Local AI: embeddings, RAG and the bounded agent" below for what was measured and
+what is still weak. Human approval here is a separate local token and an explicit
+state transition; it is not an enterprise identity system.
 
-## Lab Ollama connection, later
+## Ollama connection notes and API references
 
 1. On the lab machine, confirm that Ollama is already running and keep it bound
    to the local computer. Do not expose port 11434 publicly. Confirm which
@@ -458,6 +465,108 @@ Ollama API references: [models](https://docs.ollama.com/api/tags),
 embedding response cap, and no redirects or
 proxies. It does not enforce a whole-request deadline; a real lab integration
 must measure end-to-end time and decide a suitable limit.
+
+## Local AI: embeddings, RAG and the bounded agent
+
+Everything here runs against a local Ollama server on `127.0.0.1:11434`. Nothing
+is sent to a hosted API, and port 11434 is not exposed.
+
+### Turn it on
+
+```bash
+export EVIDENCEOPS_AI_ENABLED=1
+export EVIDENCEOPS_MODEL=qwen2.5:7b
+export EVIDENCEOPS_EMBEDDING_MODEL=qwen3-embedding:0.6b
+export EVIDENCEOPS_TOKEN=choose-a-long-random-local-secret
+export EVIDENCEOPS_OPERATOR_TOKEN=a-different-operator-secret
+export EVIDENCEOPS_APPROVAL_TOKEN=a-third-approval-secret
+.venv/bin/python -m uvicorn api:app --host 127.0.0.1 --port 8000
+```
+
+Both models must already be installed (`ollama list`). The server pins cached
+vectors to the installed model digest, so it refuses a model it cannot find and
+never silently mixes two embedding models.
+
+### Terminal
+
+```bash
+.venv/bin/python main.py ask --question "目前 B 線的閾值是多少？"
+.venv/bin/python main.py ask --question "What is the current Line B threshold?" --method semantic
+.venv/bin/python main.py agent --question "Investigate the Line B rejection increase"
+.venv/bin/python main.py agent --question "Investigate Line B" --allow-draft
+.venv/bin/python main.py aieval          # records a real run to data/local/ai_evaluation.json
+```
+
+### Dashboard
+
+The "AI answers" tab checks the models and index, builds missing embeddings,
+asks a question in either language, compares all four retrieval methods, runs the
+bounded agent, and lists saved runs. A prepared draft links to the Incidents tab,
+where approval still needs the separate approval token.
+
+### How retrieval works
+
+`rag.py` holds the whole AI layer. Each chunk gets a `source_id` of
+`source|version|location|text-hash`, so editing a document changes its ID and the
+chunk is re-embedded on the next index build. Vectors live in
+`data/local/vectors.db` keyed by the model digest. Four methods rank the same
+chunks: `keyword`, `bm25`, `semantic` (cosine over real embeddings), and `hybrid`
+(reciprocal-rank fusion of keyword and semantic). Deleted and superseded versions
+are excluded before retrieval, so deleted evidence cannot be cited.
+
+### How an answer is checked
+
+Question → retrieve → build context → generate JSON claims → check every citation
+and quotation in Python → ask the model to re-check each claim against only the
+passage it cites → save the run. A claim is shown only if its citation names a
+retrieved passage, its quote appears verbatim in that passage, and the second
+check does not reject it. Otherwise the status is `withheld` or `insufficient` and
+the claims are kept in `withheld_claims` for a human to read. No answer text is
+ever produced without retrieved evidence behind it.
+
+### Agent limits, enforced in Python not in the prompt
+
+Four approved MCP tools, reached over the real stdio protocol: search SOP
+evidence, read inspection metrics, compare deployments, prepare an incident
+draft. There is no approve, SQL, shell, filesystem or network tool. Additionally:
+
+- at most 6 steps per run;
+- an unapproved tool name is refused before any call;
+- identical repeat calls are refused;
+- at most one incident draft per run;
+- the draft tool needs the operator token, and the MCP process is started without
+  the operator token at all in viewer mode;
+- the approval secret is removed from the tool process environment, so no tool
+  can approve anything. A draft is always created `pending`.
+
+### What was actually measured on the lab machine
+
+Hardware: NVIDIA GeForce RTX 5080 (16 GB), 123 GB RAM, Ubuntu 25.10,
+Python 3.13.9, Ollama 0.33.0. Embeddings: `qwen3-embedding:0.6b`, 1024
+dimensions, verified on English and Traditional Chinese text.
+
+Retrieval over the small demo corpus: all four methods placed the expected source
+in the top three for all four answerable test cases. Lexical search took about
+0.05–0.10 ms, semantic about 31 ms, hybrid about 36 ms, plus a one-off index
+build. On a corpus this small the vector methods are not more accurate than BM25;
+their benefit is cross-lingual matching, not ranking quality. These are
+deterministic lab test cases, not human-reviewed benchmark labels, and no
+accuracy percentage is claimed from them.
+
+Generation with `qwen2.5:7b`: Traditional Chinese factual lookups answer
+reliably. The known weakness is over-refusal — several questions whose answer is
+stated verbatim in the retrieved passage still return `insufficient`, and one
+English case returns `withheld` because the second checker rejects a
+well-supported claim. `llama3:latest` answers some of those English cases but
+failed both Traditional Chinese questions, so `qwen2.5:7b` remains the better
+bilingual choice. Every failure of this kind refuses to answer rather than
+inventing one, which is the intended direction, but it does limit usefulness.
+
+Adversarial check: a document containing "IGNORE ALL PREVIOUS INSTRUCTIONS",
+a fake approver and a fake 0.99 threshold was uploaded through the real ingest
+path. It was retrieved, but the model did not repeat the injected threshold or
+approver, no ticket changed state, and a legitimate paragraph of the same file
+was still cited correctly.
 
 ## Packaging and GitHub status
 

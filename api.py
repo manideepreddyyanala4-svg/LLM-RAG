@@ -15,6 +15,9 @@ from retrieval import search_bilingual, search_bm25, current_evidence
 from evaluation import evaluate_questions, compare_searches, review_label, read_verified_questions, REVIEW_SOURCES
 from investigation import investigation_report, prepare_ticket, list_tickets, approve_ticket, change_ticket, ticket_history
 from workflow import run_workflow, record_workflow_run, list_workflow_runs
+from rag import answer_question, compare_methods, run_agent, ai_status, build_index, evidence_documents, RUNS
+from ollama_client import ai_settings
+from database import list_ai_runs
 
 app = FastAPI(title="EvidenceOps", docs_url=None, redoc_url=None, openapi_url=None)
 STORE = LOCAL / "documents.db"
@@ -93,6 +96,15 @@ class WorkflowInput(BaseModel):
     kind: Literal["inspection", "deployment", "sop_conflict"] = "inspection"
 
 
+class AskInput(BaseModel):
+    question: str = Field(min_length=1, max_length=1000)
+    method: Literal["keyword", "bm25", "semantic", "hybrid"] = "hybrid"
+
+
+class AgentInput(BaseModel):
+    request: str = Field(min_length=1, max_length=1000)
+
+
 class LabelReview(BaseModel):
     question_id: str = Field(min_length=1, max_length=20)
     expected_source: str = Field(min_length=1, max_length=200)
@@ -150,7 +162,8 @@ def homepage():
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "data_available": DATA.is_dir(), "model_available": False}
+    return {"status": "ok", "data_available": DATA.is_dir(),
+            "ai_configured": os.environ.get("EVIDENCEOPS_AI_ENABLED") == "1"}
 
 
 @app.get("/api/overview")
@@ -170,7 +183,8 @@ def overview(x_evidenceops_token: str | None = Header(default=None)):
             pending += 1
     return {"evidence_chunks": len(evidence), "questions": len(questions),
             "reviewed_questions": len(reviewed), "tickets": len(saved_tickets),
-            "pending_tickets": pending, "model_available": False}
+            "pending_tickets": pending,
+            "ai_configured": os.environ.get("EVIDENCEOPS_AI_ENABLED") == "1"}
 
 
 @app.post("/api/search")
@@ -442,10 +456,77 @@ def history(ticket_id: int, x_evidenceops_token: str | None = Header(default=Non
         raise HTTPException(503, "Ticket store unavailable") from error
 
 
-@app.post("/api/agent")
-def agent(payload: Question, x_evidenceops_token: str | None = Header(default=None)):
+def ai_error(error):
+    """Turn a real configuration, Ollama or embedding failure into one API error."""
+    return HTTPException(503, f"AI unavailable: {error}")
+
+
+@app.get("/api/ai/status")
+def ai_state(x_evidenceops_token: str | None = Header(default=None)):
+    """Report the configured, installed models and the stored vector index."""
     authorize(x_evidenceops_token)
-    raise HTTPException(503, "Model inference is unavailable; use search and investigation")
+    try:
+        return ai_status()
+    except (RuntimeError, ValueError, OSError, sqlite3.DatabaseError) as error:
+        raise ai_error(error) from error
+
+
+@app.post("/api/ai/index")
+def ai_index(rebuild: bool = False, x_evidenceops_token: str | None = Header(default=None),
+             x_operator_token: str | None = Header(default=None)):
+    """Embed any chunk with no cached vector; rebuild drops the stored vectors first."""
+    authorize(x_evidenceops_token)
+    authorize_operator(x_operator_token)
+    try:
+        index = build_index(evidence_documents(), ai_settings(), rebuild)
+    except (RuntimeError, ValueError, OSError, sqlite3.DatabaseError) as error:
+        raise ai_error(error) from error
+    return {"model_key": index["model_key"], "dimensions": index["dimensions"],
+            "chunks": index["chunks"], "embedded": index["embedded"], "reused": index["reused"]}
+
+
+@app.post("/api/ask")
+def ask(payload: AskInput, x_evidenceops_token: str | None = Header(default=None)):
+    """Retrieve real evidence, generate a grounded answer, and verify its citations."""
+    authorize(x_evidenceops_token)
+    try:
+        return answer_question(payload.question, payload.method)
+    except (RuntimeError, ValueError, OSError, sqlite3.DatabaseError) as error:
+        raise ai_error(error) from error
+
+
+@app.post("/api/retrieval/compare")
+def retrieval_compare(payload: AskInput, x_evidenceops_token: str | None = Header(default=None)):
+    """Rank the same chunks with all four methods for one question."""
+    authorize(x_evidenceops_token)
+    try:
+        return compare_methods(payload.question)
+    except (RuntimeError, ValueError, OSError, sqlite3.DatabaseError) as error:
+        raise ai_error(error) from error
+
+
+@app.post("/api/agent")
+def agent(payload: AgentInput, x_evidenceops_token: str | None = Header(default=None),
+          x_operator_token: str | None = Header(default=None)):
+    """Run the bounded agent; a draft needs the operator token, approval still needs a human."""
+    authorize(x_evidenceops_token)
+    allow_draft = bool(x_operator_token)
+    if allow_draft:
+        authorize_operator(x_operator_token)
+    try:
+        return run_agent(payload.request, allow_draft)
+    except (RuntimeError, ValueError, OSError, sqlite3.DatabaseError) as error:
+        raise ai_error(error) from error
+
+
+@app.get("/api/ai/runs")
+def ai_runs(x_evidenceops_token: str | None = Header(default=None)):
+    """Read the latest saved AI runs, including withheld and failed ones."""
+    authorize(x_evidenceops_token)
+    try:
+        return {"runs": list_ai_runs(RUNS)}
+    except (OSError, ValueError, sqlite3.DatabaseError) as error:
+        raise HTTPException(503, "AI run history unavailable") from error
 
 
 @app.post("/api/workflow")

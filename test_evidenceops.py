@@ -21,7 +21,9 @@ from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 from retrieval import search_documents, search_bilingual, search_bm25, search_vectors, hybrid_search, current_evidence, words
 from evaluation import evaluate_questions, compare_searches, review_label, read_verified_questions
 from investigation import summarize_metrics, investigation_report, prepare_ticket, list_tickets, change_ticket, ticket_history
-from ollama_client import ask_ollama, embed_texts, build_grounded_prompt, list_ollama_models
+from ollama_client import ask_ollama, embed_texts, build_grounded_prompt, list_ollama_models, grounded_answer, cited_passages, check_claims
+from database import embedding_cache, save_embeddings, save_ai_run, list_ai_runs
+import rag
 from fastapi.testclient import TestClient
 from api import app
 from mcp import Client
@@ -30,6 +32,27 @@ from mcp_client import main as mcp_client_main
 from workflow import run_workflow, compare_deployments, record_workflow_run, list_workflow_runs
 from database import setup_database, setup_vectors, ingest_version, ingest_inspections, delete_inactive_version
 import main as terminal
+
+
+def starter_dataset_present():
+    """True only for the full EvidenceOps starter dataset, not the tiny `demo` files.
+
+    These tests assert values from that dataset (Line A records, a 3.05% Line B v3
+    rate, a -0.10 threshold change). `EvidenceOps_Data_Starter/` is gitignored, so a
+    fresh clone has no copy of it and `main.py demo` writes placeholders instead.
+    """
+    try:
+        rows = read_csv(DATA / "metrics.csv", ["date", "line", "camera", "model"])
+    except (OSError, ValueError):
+        return False
+    lines = {row["line"] for row in rows}
+    return "A" in lines and len(rows) > 2
+
+
+NEEDS_STARTER = unittest.skipUnless(
+    starter_dataset_present(),
+    "The full EvidenceOps starter dataset is missing from EvidenceOps_Data_Starter/data "
+    "(it is gitignored); only the tiny `main.py demo` placeholders are present.")
 
 
 def make_test_pdf():
@@ -75,6 +98,7 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(result["location"], "paragraph 2")
         self.assertEqual(result["score"], 2)
 
+    @NEEDS_STARTER
     def test_csv_evidence_excludes_answers(self):
         documents = load_documents(include_csv=True)
         self.assertEqual(len(documents), 17)
@@ -148,6 +172,7 @@ class EvidenceTests(unittest.TestCase):
             report = json.loads(output.getvalue())
             self.assertEqual((report["total"], report["top1"], report["top3"]), (1, 1, 1))
 
+    @NEEDS_STARTER
     def test_real_calculations(self):
         rows = read_csv(DATA / "metrics.csv", [])
         groups = summarize_metrics(rows)
@@ -268,6 +293,7 @@ class EvidenceTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "ambiguous"):
                 investigation_report(DATA, [])
 
+    @NEEDS_STARTER
     def test_bilingual_and_version_changes(self):
         documents = load_documents()
         result = search_bilingual(documents, "閾值是多少？")
@@ -486,6 +512,7 @@ class EvidenceTests(unittest.TestCase):
                         self.assertEqual(terminal.main(), 0)
             self.assertIn("Restored SQLite files", output.getvalue())
 
+    @NEEDS_STARTER
     def test_api_access_and_actions(self):
         with tempfile.TemporaryDirectory() as folder:
             with patch.dict(os.environ, {"EVIDENCEOPS_TOKEN": "test-only-token",
@@ -633,6 +660,7 @@ class EvidenceTests(unittest.TestCase):
                     self.assertEqual([row["state"] for row in client.get("/api/tickets", headers=headers).json()["tickets"]],
                                      ["rejected", "completed"])
 
+    @NEEDS_STARTER
     def test_mcp_real_tool_protocol(self):
         async def check():
             with patch.dict(os.environ, {"EVIDENCEOPS_TOKEN": "test-only-token",
@@ -705,6 +733,7 @@ class EvidenceTests(unittest.TestCase):
                         with patch.dict(os.environ, {"EVIDENCEOPS_APPROVAL_TOKEN": "operator-test"}):
                             self.assertEqual(client.post(target, headers=approver).status_code, 503)
 
+    @NEEDS_STARTER
     def test_full_offline_investigation_survives_restart(self):
         with tempfile.TemporaryDirectory() as folder:
             local = Path(folder)
@@ -806,6 +835,7 @@ class EvidenceTests(unittest.TestCase):
                     and row["location"] == first["location"]]
         self.assertEqual(matching[0]["methods"].count("semantic"), 1)
 
+    @NEEDS_STARTER
     def test_three_real_workflows_and_pending_ticket_restart(self):
         with tempfile.TemporaryDirectory() as folder:
             tickets = Path(folder) / "tickets.db"
@@ -836,6 +866,7 @@ class EvidenceTests(unittest.TestCase):
             self.assertIn("Line B v4 deployment record", missing)
             self.assertIn("Missing:", report)
 
+    @NEEDS_STARTER
     def test_workflow_api_requires_separate_ticket_approval(self):
         with tempfile.TemporaryDirectory() as folder:
             with patch.dict(os.environ, {"EVIDENCEOPS_TOKEN": "workflow-access",
@@ -1282,6 +1313,252 @@ class EvidenceTests(unittest.TestCase):
                                       report.json()["top3"]), (1, 1, 1))
                     self.assertTrue(report.json()["reviewed_only"])
                     self.assertIn('"reviewed_only": true', json.dumps(report.json()))
+
+
+class RagTests(unittest.TestCase):
+    """Offline tests for the AI layer. No Ollama call is made here."""
+
+    def test_source_id_changes_when_chunk_text_changes(self):
+        first = dict(source="sop_v2_en.txt", version="demo-v2", location="paragraph 2", text="Threshold is 0.50.")
+        same = dict(first)
+        edited = dict(first, text="Threshold is 0.40.")
+        moved = dict(first, location="paragraph 3")
+        newer = dict(first, version="demo-v3")
+        self.assertEqual(rag.source_id(first), rag.source_id(same))
+        for other in (edited, moved, newer):
+            self.assertNotEqual(rag.source_id(first), rag.source_id(other))
+        missing = dict(first)
+        del missing["version"]
+        self.assertIn("unknown", rag.source_id(missing))
+
+    def test_index_refuses_mixed_or_absent_dimensions(self):
+        wanted = {"a": "x", "b": "y"}
+        self.assertEqual(rag.check_dimensions({"a": [1.0, 2.0], "b": [3.0, 4.0]}, wanted), 2)
+        with self.assertRaises(RuntimeError):
+            rag.check_dimensions({"a": [1.0, 2.0], "b": [3.0]}, wanted)
+        with self.assertRaises(RuntimeError):
+            rag.check_dimensions({"a": [1.0, 2.0]}, wanted)
+
+    def test_build_index_reuses_cached_vectors_and_embeds_only_new_chunks(self):
+        documents = [dict(source="a.txt", version="v1", location="paragraph 1", text="first"),
+                     dict(source="a.txt", version="v1", location="paragraph 2", text="second")]
+        config = {"endpoint": "http://127.0.0.1:11434", "embedding_model": "fake-embed",
+                  "model": "fake-gen", "timeout": 10}
+        requested = []
+
+        def fake_embed(texts, endpoint, model, approved, timeout):
+            requested.append(list(texts))
+            return {"vectors": [[1.0, 0.0] for _ in texts], "dimensions": 2, "model": model}
+
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.object(rag, "VECTORS", Path(folder) / "vectors.db"), \
+                 patch.object(rag, "embed_texts", fake_embed), \
+                 patch.object(rag, "installed_model", lambda config, embedding=False: "fake-embed@digest"):
+                first = rag.build_index(documents, config)
+                self.assertEqual((first["embedded"], first["reused"], first["dimensions"]), (2, 0, 2))
+                second = rag.build_index(documents, config)
+                self.assertEqual((second["embedded"], second["reused"]), (0, 2))
+                grown = documents + [dict(source="a.txt", version="v1", location="paragraph 3", text="third")]
+                third = rag.build_index(grown, config)
+                self.assertEqual((third["embedded"], third["reused"]), (1, 2))
+                self.assertEqual(requested[-1], ["third"])
+                rebuilt = rag.build_index(documents, config, rebuild=True)
+                self.assertEqual(rebuilt["embedded"], 2)
+
+    def test_build_index_reports_a_real_embedding_failure(self):
+        documents = [dict(source="a.txt", version="v1", location="paragraph 1", text="first")]
+        config = {"endpoint": "http://127.0.0.1:11434", "embedding_model": "fake-embed",
+                  "model": "fake-gen", "timeout": 10}
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.object(rag, "VECTORS", Path(folder) / "vectors.db"), \
+                 patch.object(rag, "installed_model", lambda config, embedding=False: "fake-embed@digest"), \
+                 patch.object(rag, "embed_texts", lambda *args, **kwargs: {"error": "timed out", "code": "unavailable"}):
+                with self.assertRaises(RuntimeError):
+                    rag.build_index(documents, config)
+
+    def test_semantic_search_refuses_a_dimension_mismatch(self):
+        documents = [dict(source="a.txt", version="v1", location="paragraph 1", text="first")]
+        config = {"endpoint": "http://127.0.0.1:11434", "embedding_model": "fake-embed", "timeout": 10}
+        index = {rag.source_id(documents[0]): [1.0, 0.0]}
+        with patch.object(rag, "embed_texts", lambda *a, **k: {"vectors": [[1.0, 0.0, 0.0]], "dimensions": 3}):
+            with self.assertRaises(RuntimeError):
+                rag.semantic_results(documents, "question", config, index, 2)
+        with patch.object(rag, "embed_texts", lambda *a, **k: {"vectors": [[1.0, 0.0]], "dimensions": 2}):
+            results = rag.semantic_results(documents, "question", config, index, 2)
+            self.assertEqual(results[0]["method"], "semantic")
+
+    def test_retrieve_rejects_an_unknown_method(self):
+        with self.assertRaises(ValueError):
+            rag.retrieve("question", "magic", documents=[], config={})
+
+    def test_agent_may_not_use_an_unapproved_tool_or_approve_anything(self):
+        for bad in ({"tool": "approve_ticket"}, {"tool": "run_sql"}, {"tool": None},
+                    {"tool": "__import__"}, {}):
+            with self.assertRaises(ValueError):
+                rag.tool_arguments(bad, True)
+        # No state-changing approval tool exists at all, in either role.
+        for forbidden in ("approve_ticket", "change_ticket", "approve", "reject_ticket",
+                          "complete_ticket", "delete_document", "run_sql"):
+            self.assertNotIn(forbidden, rag.AGENT_TOOLS)
+        # The only tool that writes anything creates a pending draft a human must decide on.
+        self.assertEqual([name for name in rag.AGENT_TOOLS if "ticket" in name],
+                         ["prepare_incident_ticket"])
+
+    def test_agent_draft_tool_needs_the_operator_role(self):
+        draft = {"tool": "prepare_incident_ticket", "tool_question": "Review Line B"}
+        with self.assertRaises(ValueError):
+            rag.tool_arguments(draft, False)
+        name, arguments = rag.tool_arguments(draft, True)
+        self.assertEqual((name, arguments), ("prepare_incident_ticket", {"question": "Review Line B"}))
+
+    def test_agent_may_prepare_only_one_draft_per_run(self):
+        draft = {"tool": "prepare_incident_ticket", "tool_question": "Review Line B"}
+        self.assertEqual(rag.tool_arguments(draft, True, False)[0], "prepare_incident_ticket")
+        with self.assertRaises(ValueError):
+            rag.tool_arguments(draft, True, True)
+        # A second read-only call is still fine after a draft exists.
+        self.assertEqual(rag.tool_arguments({"tool": "read_inspection_metrics", "line": "B"}, True, True)[0],
+                         "read_inspection_metrics")
+
+    def test_agent_tool_arguments_are_validated(self):
+        for line in ("Z", "", None, "a"):
+            with self.assertRaises(ValueError):
+                rag.tool_arguments({"tool": "read_inspection_metrics", "line": line}, True)
+        self.assertEqual(rag.tool_arguments({"tool": "read_inspection_metrics", "line": "B"}, True),
+                         ("read_inspection_metrics", {"line": "B"}))
+        self.assertEqual(rag.tool_arguments({"tool": "compare_model_deployments", "line": "A"}, True),
+                         ("compare_model_deployments", {"line": "A"}))
+        for question in ("", "   ", None, 5, "x" * 1001):
+            with self.assertRaises(ValueError):
+                rag.tool_arguments({"tool": "search_approved_documents", "tool_question": question}, True)
+        self.assertEqual(rag.tool_arguments({"tool": "search_approved_documents", "tool_question": " shift "}, True),
+                         ("search_approved_documents", {"question": "shift"}))
+
+    def test_agent_tool_process_never_receives_the_approval_secret(self):
+        with patch.dict(os.environ, {"EVIDENCEOPS_TOKEN": "access", "EVIDENCEOPS_OPERATOR_TOKEN": "operator",
+                                     "EVIDENCEOPS_APPROVAL_TOKEN": "approval"}):
+            viewer = rag.server_settings(False).env
+            operator = rag.server_settings(True).env
+        self.assertNotIn("EVIDENCEOPS_APPROVAL_TOKEN", viewer)
+        self.assertNotIn("EVIDENCEOPS_APPROVAL_TOKEN", operator)
+        self.assertNotIn("EVIDENCEOPS_OPERATOR_TOKEN", viewer)
+        self.assertEqual(viewer["EVIDENCEOPS_MCP_ROLE"], "viewer")
+        self.assertEqual(operator["EVIDENCEOPS_MCP_ROLE"], "operator")
+        self.assertEqual(operator["EVIDENCEOPS_OPERATOR_TOKEN"], "operator")
+
+    def test_run_agent_rejects_an_invalid_request(self):
+        for bad in ("", "   ", "x" * 1001, None, 7):
+            with self.assertRaises(ValueError):
+                rag.run_agent(bad)
+
+    def test_tool_output_reads_json_text_blocks_as_data(self):
+        structured = MagicMock(structured_content={"result": [1, 2]})
+        self.assertEqual(rag.tool_output(structured), {"result": [1, 2]})
+        block = MagicMock(text='{"id": 1, "state": "pending"}')
+        self.assertEqual(rag.tool_output(MagicMock(structured_content=None, content=[block])),
+                         {"id": 1, "state": "pending"})
+        plain = MagicMock(text="not json")
+        self.assertEqual(rag.tool_output(MagicMock(structured_content=None, content=[plain])), "not json")
+
+    def test_cited_passages_sends_only_the_passages_a_claim_cites(self):
+        context = [{"citation_id": "E1", "text": "one"}, {"citation_id": "E2", "text": "two"},
+                   {"citation_id": "E3", "text": "three"}]
+        claims = [{"text": "a", "citation": "E3"}, {"text": "b", "citation": "E1"}]
+        passages = cited_passages(claims, context)
+        self.assertEqual([row["citation_id"] for row in passages], ["E1", "E3"])
+
+    def test_answer_language_follows_the_question_script(self):
+        config = {"endpoint": "http://127.0.0.1:11434", "model": "fake", "timeout": 10}
+        seen = {}
+
+        def fake_chat(messages, config, schema=None, tools=None):
+            seen["system"] = messages[0]["content"]
+            return {"message": {"content": json.dumps({"insufficient": True, "claims": []})},
+                    "elapsed_ms": 1.0, "model": "fake", "eval_count": 1}
+
+        evidence = [{"source": "sop_v2_en.txt", "location": "paragraph 2", "text": "Threshold is 0.50."}]
+        with patch("ollama_client.chat_ollama", fake_chat):
+            english = grounded_answer("What is the threshold?", evidence, config)
+            self.assertIn("Write every claim in English", seen["system"])
+            self.assertEqual(english["answer"], "Insufficient evidence to answer this question.")
+            chinese = grounded_answer("閾值是多少？", evidence, config)
+            self.assertIn("Write every claim in Traditional Chinese", seen["system"])
+            self.assertEqual(chinese["answer"], "證據不足，無法回答此問題。")
+
+    def test_withheld_claims_are_kept_for_human_review(self):
+        config = {"endpoint": "http://127.0.0.1:11434", "model": "fake", "timeout": 10}
+        claims = [{"text": "Threshold is 0.99.", "citation": "E1", "quote": "no such quote"}]
+
+        def fake_chat(messages, config, schema=None, tools=None):
+            return {"message": {"content": json.dumps({"insufficient": False, "claims": claims})},
+                    "elapsed_ms": 1.0, "model": "fake", "eval_count": 1}
+
+        evidence = [{"source": "sop_v2_en.txt", "location": "paragraph 2", "text": "Threshold is 0.50."}]
+        with patch("ollama_client.chat_ollama", fake_chat):
+            result = grounded_answer("What is the threshold?", evidence, config)
+        self.assertEqual(result["status"], "withheld")
+        self.assertTrue(result["citation_errors"])
+        self.assertEqual(result["withheld_claims"], claims)
+        self.assertNotIn("0.99", result["answer"])
+
+    def test_ai_endpoints_need_the_access_token_and_report_a_real_failure(self):
+        client = TestClient(app)
+        for path, body in (("/api/ask", {"question": "x"}), ("/api/agent", {"request": "x"}),
+                           ("/api/retrieval/compare", {"question": "x"})):
+            self.assertEqual(client.post(path, json=body).status_code, 503)
+        with patch.dict(os.environ, {"EVIDENCEOPS_TOKEN": "access"}, clear=True):
+            self.assertEqual(client.post("/api/ask", json={"question": "x"}).status_code, 403)
+            headers = {"X-Evidenceops-Token": "access"}
+            # AI is not enabled here, so the endpoints must say so rather than invent an answer.
+            for path, body in (("/api/ask", {"question": "x"}), ("/api/agent", {"request": "x"})):
+                response = client.post(path, json=body, headers=headers)
+                self.assertEqual(response.status_code, 503)
+                self.assertIn("AI unavailable", response.json()["detail"])
+            self.assertEqual(client.get("/api/ai/status", headers=headers).status_code, 503)
+            self.assertEqual(client.post("/api/ask", json={"question": "x", "method": "magic"},
+                                         headers=headers).status_code, 422)
+            self.assertEqual(client.post("/api/ask", json={"question": ""}, headers=headers).status_code, 422)
+            self.assertEqual(client.post("/api/agent", json={"request": "x" * 1001},
+                                         headers=headers).status_code, 422)
+
+    def test_index_endpoint_needs_the_operator_token(self):
+        client = TestClient(app)
+        with patch.dict(os.environ, {"EVIDENCEOPS_TOKEN": "access"}, clear=True):
+            response = client.post("/api/ai/index", headers={"X-Evidenceops-Token": "access"})
+            self.assertEqual(response.status_code, 503)
+            self.assertIn("OPERATOR", response.json()["detail"].upper())
+        with patch.dict(os.environ, {"EVIDENCEOPS_TOKEN": "access",
+                                     "EVIDENCEOPS_OPERATOR_TOKEN": "operator"}, clear=True):
+            response = client.post("/api/ai/index", headers={"X-Evidenceops-Token": "access",
+                                                             "X-Operator-Token": "wrong"})
+            self.assertEqual(response.status_code, 403)
+
+    def test_saved_ai_runs_round_trip(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "ai_runs.db"
+            self.assertEqual(list_ai_runs(path), [])
+            run_id = save_ai_run(path, {"kind": "rag_answer", "question": "閾值是多少？",
+                                        "answer": "證據不足。", "status": "insufficient"})
+            runs = list_ai_runs(path)
+            self.assertEqual(len(runs), 1)
+            self.assertEqual(runs[0]["run_id"], run_id)
+            self.assertEqual(runs[0]["question"], "閾值是多少？")
+            self.assertEqual(runs[0]["status"], "insufficient")
+
+    def test_dashboard_only_calls_endpoints_that_exist(self):
+        html = (Path(__file__).resolve().parent / "dashboard.html").read_text(encoding="utf-8")
+        import re
+        called = set(re.findall(r"""call\(\s*[`'"](/api/[^`'"?$]*)""", html))
+        called |= set(re.findall(r"""fetch\(\s*[`'"](/api/[^`'"?$]*)""", html))
+        self.assertIn("/api/ask", called)
+        self.assertIn("/api/agent", called)
+        paths = {route.path for route in app.routes}
+        prefixes = [path.split("{")[0] for path in paths if "{" in path]
+        for path in called:
+            if path in paths:
+                continue
+            self.assertTrue(any(path.startswith(prefix) for prefix in prefixes),
+                            f"dashboard calls a missing endpoint: {path}")
 
 
 if __name__ == "__main__":

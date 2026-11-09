@@ -32,17 +32,26 @@
   <header><div class="eyebrow">Agent Reliability Lab</div><h1>EvidenceOps</h1><p>Local investigation desk · synthetic records · source-linked findings</p></header>
   <main>
     <nav aria-label="Sections">
-      <button class="active" data-tab="overview">Overview</button><button data-tab="search">Search</button><button data-tab="documents">Documents</button><button data-tab="investigation">Investigation</button><button data-tab="evaluation">Evaluation</button><button data-tab="tickets">Incidents</button><button data-tab="workflow">Workflow</button>
+      <button class="active" data-tab="overview">Overview</button><button data-tab="search">Search</button><button data-tab="documents">Documents</button><button data-tab="investigation">Investigation</button><button data-tab="evaluation">Evaluation</button><button data-tab="tickets">Incidents</button><button data-tab="workflow">Workflow</button><button data-tab="ai">AI answers</button>
     </nav>
     <div>
       <div class="panel"><label for="token">Local access token</label><input id="token" type="password" autocomplete="off" placeholder="EVIDENCEOPS_TOKEN from your CMD session"><label for="operator-token">Operator token</label><input id="operator-token" type="password" autocomplete="off" placeholder="EVIDENCEOPS_OPERATOR_TOKEN"><label for="approval-token">Human approval token</label><input id="approval-token" type="password" autocomplete="off" placeholder="EVIDENCEOPS_APPROVAL_TOKEN"><small>Used only in requests to this local server. This page does not store these tokens.</small><div id="message" role="status" aria-live="polite"></div></div>
-      <section id="overview" class="active"><div class="panel"><h2>Local system overview</h2><p class="muted">Enter the access token above, then load the current evidence, review, and ticket counts. Model inference remains unavailable on this laptop.</p><button class="primary" id="overview-go">Refresh status</button><div id="overview-output"></div></div></section>
+      <section id="overview" class="active"><div class="panel"><h2>Local system overview</h2><p class="muted">Enter the access token above, then load the current evidence, review, and ticket counts. Local model status is shown below.</p><button class="primary" id="overview-go">Refresh status</button><div id="overview-output"></div></div></section>
       <section id="search"><div class="panel"><h2>Search evidence</h2><p class="muted">English words and Traditional Chinese character pairs. Scores are lexical.</p><label for="question">Question</label><input id="question" placeholder="What changed in model v4?"><label for="method">Ranking method</label><select id="method"><option value="keyword">Keyword overlap</option><option value="bm25">BM25</option></select><label for="search-source">Source filename (optional)</label><input id="search-source" placeholder="sop_v2_en.txt"><label for="search-version">Version (optional)</label><input id="search-version" placeholder="SOP-V2-EN"><label><input id="active-only" type="checkbox" checked> Current or active evidence only (uncheck for history)</label><label><input id="csv" type="checkbox" checked> Include small inspection and deployment CSV records</label><button class="primary" id="search-go">Search</button><div id="search-output"></div></div></section>
       <section id="documents"><div class="panel"><h2>Documents</h2><button class="secondary" id="documents-go">Refresh inventory</button><button class="secondary" id="dataset-go">Parquet metadata</button><div id="documents-output"></div></div><div class="panel"><h3>Add a local document version</h3><p class="muted">Existing versions remain available. Text is limited to 100 KB; PDFs are limited to 2 MB and need extractable text or installed OCR tools.</p><label for="source">Filename for pasted text</label><input id="source" placeholder="procedure.txt"><label for="version">Version</label><input id="version" placeholder="v1"><label for="doc-text">Paste text</label><textarea id="doc-text"></textarea><button class="primary" id="ingest-go">Add pasted text</button><label for="upload-file">Or choose a .txt or .pdf file</label><input id="upload-file" type="file" accept=".txt,.pdf"><button class="secondary" id="upload-go">Upload selected file</button></div></section>
       <section id="investigation"><div class="panel"><h2>Operational investigation</h2><p class="muted">Calculated from local synthetic inspection and deployment records.</p><button class="primary" id="investigation-go">Calculate rejection report</button><button class="secondary" id="deployment-go">Compare Line B deployments</button><div id="investigation-output"></div></div></section>
       <section id="evaluation"><div class="panel"><h2>Retrieval evaluation</h2><p class="muted">The supplied answers and sources are unverified proposals. Open the cited records, type the sources you confirmed, then save each review with the approval token.</p><button class="secondary" id="labels-go">Review labels</button><button class="secondary" id="compare-go">Compare lexical methods</button><div id="labels-output"></div><button class="primary" id="evaluate-go">Evaluate saved reviews</button><div id="evaluation-output"></div></div></section>
       <section id="tickets"><div class="panel"><h2>Incident drafts</h2><p class="muted">Preparation creates a pending draft. Decisions require the separate human approval token above.</p><label for="ticket-question">Investigation question</label><input id="ticket-question" placeholder="Review the Line B rejection increase"><button class="primary" id="ticket-go">Prepare draft</button><button class="secondary" id="tickets-go">Refresh incidents</button><div id="tickets-output"></div></div></section>
-      <section id="workflow"><div class="panel"><h2>Fixed workflow trace</h2><p class="muted">Two simple Python steps use keyword search and deterministic calculations. The SOP review creates only a pending ticket. No LLM reasoning is claimed.</p><label for="workflow-kind">Workflow</label><select id="workflow-kind"><option value="inspection">Investigate rejection rates</option><option value="deployment">Compare deployments</option><option value="sop_conflict">Review SOP versions and prepare ticket</option></select><label for="workflow-question">Question</label><input id="workflow-question" placeholder="What evidence explains the rejection increase?"><button class="primary" id="workflow-go">Run fixed workflow</button><button class="secondary" id="workflow-history-go">View run history</button><div id="workflow-output"></div><p class="muted">AI agent inference: unavailable until an authorized lab model is connected.</p></div></section>
+      <section id="workflow"><div class="panel"><h2>Fixed workflow trace</h2><p class="muted">Two simple Python steps use keyword search and deterministic calculations. The SOP review creates only a pending ticket. No LLM reasoning is claimed.</p><label for="workflow-kind">Workflow</label><select id="workflow-kind"><option value="inspection">Investigate rejection rates</option><option value="deployment">Compare deployments</option><option value="sop_conflict">Review SOP versions and prepare ticket</option></select><label for="workflow-question">Question</label><input id="workflow-question" placeholder="What evidence explains the rejection increase?"><button class="primary" id="workflow-go">Run fixed workflow</button><button class="secondary" id="workflow-history-go">View run history</button><div id="workflow-output"></div><p class="muted">These workflows stay deterministic. The AI answers tab runs the real model.</p></div></section>
+      <section id="ai"><div class="panel"><h2>Grounded answers (local Ollama)</h2><p class="muted">Ask in English or Traditional Chinese. The answer is generated from retrieved evidence only; claims whose citation or quotation cannot be checked are withheld.</p>
+        <button class="secondary" id="ai-status-go">Check models and index</button><button class="secondary" id="ai-index-go">Build missing embeddings</button><div id="ai-status-output"></div>
+        <label for="ai-question">Question</label><input id="ai-question" placeholder="目前 B 線的閾值是多少？">
+        <label for="ai-method">Retrieval method</label><select id="ai-method"><option value="hybrid">Hybrid (keyword + vector)</option><option value="semantic">Semantic vectors</option><option value="bm25">BM25</option><option value="keyword">Keyword overlap</option></select>
+        <button class="primary" id="ai-ask-go">Generate grounded answer</button><button class="secondary" id="ai-compare-go">Compare all four methods</button><div id="ai-output"></div></div>
+        <div class="panel"><h3>Bounded investigation agent</h3><p class="muted">The agent may call only four approved MCP tools, within a fixed step limit. It can prepare a pending incident draft with the operator token, but it can never approve one. Approve or reject in the Incidents tab with the human approval token.</p>
+        <label for="agent-request">Investigation request</label><input id="agent-request" placeholder="Investigate the Line B rejection increase">
+        <label><input id="agent-draft" type="checkbox"> Allow a pending incident draft (sends the operator token)</label>
+        <button class="primary" id="agent-go">Run agent</button><button class="secondary" id="ai-runs-go">Saved AI runs</button><div id="agent-output"></div></div></section>
     </div>
   </main>
   <script>
@@ -111,7 +120,7 @@
       if (!data) return;
       item(output, 'Current local records',
            `Evidence chunks: ${data.evidence_chunks}\nQuestions: ${data.questions}\nReviewed questions: ${data.reviewed_questions}\nTickets: ${data.tickets}\nPending tickets: ${data.pending_tickets}`);
-      item(output, 'Model inference', data.model_available ? 'Available' : 'Unavailable until lab integration');
+      item(output, 'Local AI', data.ai_configured ? 'Configured on this server; open the AI answers tab' : 'Not configured; set EVIDENCEOPS_AI_ENABLED=1');
     };
     byId('search-go').onclick = async function () {
       const output = clear('search-output');
@@ -347,6 +356,94 @@
       item(output, 'Calculated report', data.report);
       if (data.missing && data.missing.length) item(output, 'Missing information', data.missing.join('\n'));
       if (data.ticket) item(output, `Ticket #${data.ticket.id}`, `State: ${data.ticket.state}`);
+    };
+    function showAnswer(output, data) {
+      item(output, `Answer · ${data.status} · ${data.method} retrieval · ${data.model}`, data.answer);
+      for (const claim of data.claims) {
+        item(output, `Claim cites ${claim.citation}`, `${claim.text}\nVerified quotation: ${claim.quote}`);
+      }
+      for (const claim of data.withheld_claims || []) {
+        item(output, `Withheld claim (cites ${claim.citation})`, `${claim.text}\nQuoted: ${claim.quote}`);
+      }
+      if (data.citation_errors.length) item(output, 'Citation problems', data.citation_errors.join('\n'));
+      if (data.unsupported_claims.length) item(output, 'Claims the checker rejected', `Claim numbers: ${data.unsupported_claims.join(', ')}`);
+      for (const row of data.evidence) {
+        const box = item(output, `${row.citation_id} · ${row.source} · ${row.location} · ${row.version || 'unknown version'}`, row.text);
+        if (row.source.endsWith('.txt') && row.version) {
+          button(box, 'Open original file', function () {
+            const query = new URLSearchParams({source: row.source, version: row.version});
+            window.open(`/api/documents/file?${query}`, '_blank');
+          });
+        }
+      }
+      item(output, 'Measured timings and models',
+           `Retrieval: ${data.retrieval_ms} ms\nEmbedding index: ${data.index_ms} ms\nGeneration: ${data.inference_ms} ms\nCitation check: ${data.verification_ms} ms\nChunks searched: ${data.chunks_searched}\nEmbedding model: ${data.embedding_model || 'not used'}\nVector dimensions: ${data.dimensions || 'not used'}\nSaved run: ${data.run_id}`);
+      item(output, 'Verification note', data.verification);
+    }
+    byId('ai-status-go').onclick = async function () {
+      const output = clear('ai-status-output');
+      const data = await call('/api/ai/status');
+      if (!data) return;
+      item(output, 'Configured local models',
+           `Generation: ${data.generation_installed}\nEmbedding: ${data.embedding_installed}\nEndpoint: ${data.endpoint}\nTimeout: ${data.timeout} s`);
+      item(output, 'Stored vector index',
+           `Evidence chunks: ${data.chunks}\nVectors cached: ${data.vectors_cached}\nChunks without vectors: ${data.chunks_without_vectors}\nDimensions: ${data.dimensions || 'none stored yet'}`);
+    };
+    byId('ai-index-go').onclick = async function () {
+      const output = clear('ai-status-output');
+      const data = await call('/api/ai/index', 'POST', null, false, true);
+      if (!data) return;
+      item(output, 'Embedding index updated',
+           `Model: ${data.model_key}\nDimensions: ${data.dimensions}\nChunks: ${data.chunks}\nNewly embedded: ${data.embedded}\nReused from cache: ${data.reused}`);
+    };
+    byId('ai-ask-go').onclick = async function () {
+      const output = clear('ai-output');
+      const data = await call('/api/ask', 'POST', {question: byId('ai-question').value, method: byId('ai-method').value});
+      if (data) showAnswer(output, data);
+    };
+    byId('ai-compare-go').onclick = async function () {
+      const output = clear('ai-output');
+      const data = await call('/api/retrieval/compare', 'POST', {question: byId('ai-question').value});
+      if (!data) return;
+      for (const row of data.comparison) {
+        const lines = row.ranking.map(hit => `#${hit.rank} ${hit.source} ${hit.location} · score ${hit.fusion_score ?? hit.score}`);
+        item(output, `${row.method} · retrieval ${row.retrieval_ms} ms · index ${row.index_ms} ms`,
+             lines.join('\n') || 'No results');
+      }
+      item(output, 'How to read this', data.note);
+    };
+    byId('agent-go').onclick = async function () {
+      const output = clear('agent-output');
+      const draft = byId('agent-draft').checked;
+      const data = await call('/api/agent', 'POST', {request: byId('agent-request').value}, false, draft);
+      if (!data) return;
+      item(output, `Agent steps: ${data.steps_used} of ${data.step_limit} · stopped because ${data.stopped_because}`,
+           `Tools this run was allowed to use:\n${data.tools_approved.join('\n')}`);
+      let number = 0;
+      for (const step of data.steps) {
+        number += 1;
+        item(output, `Step ${number} · ${step.tool} · ${step.ok ? 'succeeded' : 'refused or failed'}`,
+             `Arguments: ${JSON.stringify(step.arguments)}\nResult: ${JSON.stringify(step.output, null, 1)}`);
+      }
+      if (data.ticket) {
+        const box = item(output, `Prepared incident draft #${data.ticket.id}`, `State: ${data.ticket.state}\nApprove or reject it in the Incidents tab.`);
+        button(box, 'Go to Incidents', function () {
+          document.querySelector('nav button[data-tab=tickets]').click();
+          byId('tickets-go').click();
+        });
+      }
+      item(output, 'Human approval', data.approval);
+      showAnswer(output, data);
+    };
+    byId('ai-runs-go').onclick = async function () {
+      const output = clear('agent-output');
+      const data = await call('/api/ai/runs');
+      if (!data) return;
+      if (!data.runs.length) item(output, 'No saved AI runs', 'Generate an answer or run the agent first.');
+      for (const run of data.runs) {
+        item(output, `#${run.run_id} · ${run.kind} · ${run.status} · ${run.at}`,
+             `Question: ${run.question}\nAnswer: ${run.answer}\nModel: ${run.model}\nSteps used: ${run.steps_used ?? 'not an agent run'}`);
+      }
     };
     byId('workflow-history-go').onclick = async function () {
       const output = clear('workflow-output');

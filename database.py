@@ -140,3 +140,70 @@ def require_dsn(dsn):
     """Reject empty settings so psycopg cannot use an implicit local login."""
     if not isinstance(dsn, str) or not dsn.strip():
         raise ValueError("An explicit PostgreSQL DSN is required")
+
+
+# The default lab setup uses SQLite; PostgreSQL above remains optional.
+def embedding_cache(path, model_key):
+    """Read vectors for exactly one model digest from the document database."""
+    import json
+    import sqlite3
+    from contextlib import closing
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(path, timeout=3)) as connection:
+        with connection:
+            connection.execute("""CREATE TABLE IF NOT EXISTS embeddings
+                (model_key TEXT, source_id TEXT, dimensions INTEGER NOT NULL,
+                 vector_json TEXT NOT NULL, PRIMARY KEY(model_key, source_id))""")
+        rows = connection.execute("SELECT source_id, dimensions, vector_json FROM embeddings WHERE model_key=?",
+                                  (model_key,)).fetchall()
+    result = {}
+    for source_id, dimensions, vector in rows:
+        values = json.loads(vector)
+        if not isinstance(values, list) or len(values) != dimensions:
+            raise ValueError("Stored embedding dimensions are corrupt; reindex the documents")
+        result[source_id] = values
+    return result
+
+
+def save_embeddings(path, model_key, rows, replace=False):
+    """Commit a complete batch atomically; reindex can remove obsolete vectors."""
+    import json
+    import sqlite3
+    from contextlib import closing
+    with closing(sqlite3.connect(path, timeout=3)) as connection:
+        with connection:
+            if replace:
+                connection.execute("DELETE FROM embeddings")
+            for source_id, vector in rows.items():
+                connection.execute("INSERT OR REPLACE INTO embeddings VALUES (?, ?, ?, ?)",
+                                   (model_key, source_id, len(vector), json.dumps(vector, allow_nan=False)))
+
+
+def save_ai_run(path, result):
+    """Persist the actual answer, checks, tool trace, models and timings."""
+    import json
+    import sqlite3
+    from contextlib import closing
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(path, timeout=3)) as connection:
+        with connection:
+            connection.execute("""CREATE TABLE IF NOT EXISTS ai_runs
+                (id INTEGER PRIMARY KEY, result_json TEXT NOT NULL,
+                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
+            cursor = connection.execute("INSERT INTO ai_runs (result_json) VALUES (?)",
+                                        (json.dumps(result, ensure_ascii=False, allow_nan=False),))
+    return cursor.lastrowid
+
+
+def list_ai_runs(path):
+    """Read the latest twenty saved AI runs, including unsuccessful runs."""
+    import json
+    import sqlite3
+    from contextlib import closing
+    if not path.exists():
+        return []
+    with closing(sqlite3.connect(path, timeout=3)) as connection:
+        if not connection.execute("SELECT 1 FROM sqlite_master WHERE name='ai_runs'").fetchone():
+            return []
+        rows = connection.execute("SELECT id, result_json, created_at FROM ai_runs ORDER BY id DESC LIMIT 20").fetchall()
+    return [dict(json.loads(row[1]), run_id=row[0], at=row[2]) for row in rows]
