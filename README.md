@@ -518,8 +518,9 @@ The app image does not include optional OCR executables, so scanned PDFs are
 rejected there unless a separately reviewed OCR image is prepared. Tests need
 mounted real fixtures. `.github/workflows/offline.yml` defines 30 dataset-free
 smoke tests, source compilation, and a separate PostgreSQL/pgvector service job
-for future GitHub CI. Its YAML parsed; all 30 selected tests and the equivalent
-live database smoke script passed locally. No hosted CI run has occurred. The
+in GitHub CI. Its YAML parsed; all 30 selected tests and the equivalent
+live database smoke script passed locally. Check the GitHub Actions page for
+the status of each published commit. The
 full 53-test suite uses the private starter dataset and runs locally.
 `.gitignore` excludes datasets, virtual environments, caches, secrets, SQLite
 files and archives. Review every future staged file before publishing.
