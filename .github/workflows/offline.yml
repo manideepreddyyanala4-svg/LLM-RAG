@@ -50,6 +50,8 @@ jobs:
           test_evidenceops.EvidenceTests.test_review_store_cannot_reference_files_outside_evidence_folder \
             test_evidenceops.EvidenceTests.test_synthetic_review_and_json_evaluation \
             test_evidenceops.EvidenceTests.test_demo_data_is_explicitly_synthetic_and_never_overwrites
+      - name: Test the AI layer without Ollama or private datasets
+        run: python -m unittest -q test_evidenceops.RagTests
 
   postgres:
     runs-on: ubuntu-latest
