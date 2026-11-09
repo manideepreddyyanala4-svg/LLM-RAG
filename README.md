@@ -517,8 +517,10 @@ are excluded before retrieval, so deleted evidence cannot be cited.
 ### How an answer is checked
 
 Question → retrieve → build context → generate JSON claims → check every citation
-and quotation in Python → ask the model to re-check each claim against only the
-passage it cites → save the run. A claim is shown only if its citation names a
+and quotation in Python → ask the model to re-check each claim, one at a time,
+against only the passage it cites → save the run. The answer schema has only a
+`claims` list; an empty list is the only way to abstain. The checker first copies
+the passage's own words, then gives a yes/no verdict. A claim is shown only if its citation names a
 retrieved passage, its quote appears verbatim in that passage, and the second
 check does not reject it. Otherwise the status is `withheld` or `insufficient` and
 the claims are kept in `withheld_claims` for a human to read. No answer text is
@@ -531,9 +533,14 @@ evidence, read inspection metrics, compare deployments, prepare an incident
 draft. There is no approve, SQL, shell, filesystem or network tool. Additionally:
 
 - at most 6 steps per run;
+- each action has a per-run budget (`ACTION_LIMITS` in `rag.py`): each line's
+  metrics and deployments once, two SOP searches, one incident draft. Used-up
+  actions are removed from the choices the model is given, and refused in code
+  if the model names one anyway;
+- `finish` is offered only after at least one SOP search, so findings can cite
+  a source;
 - an unapproved tool name is refused before any call;
 - identical repeat calls are refused;
-- at most one incident draft per run;
 - the draft tool needs the operator token, and the MCP process is started without
   the operator token at all in viewer mode;
 - the approval secret is removed from the tool process environment, so no tool
@@ -553,14 +560,33 @@ their benefit is cross-lingual matching, not ranking quality. These are
 deterministic lab test cases, not human-reviewed benchmark labels, and no
 accuracy percentage is claimed from them.
 
-Generation with `qwen2.5:7b`: Traditional Chinese factual lookups answer
-reliably. The known weakness is over-refusal — several questions whose answer is
-stated verbatim in the retrieved passage still return `insufficient`, and one
-English case returns `withheld` because the second checker rejects a
-well-supported claim. `llama3:latest` answers some of those English cases but
-failed both Traditional Chinese questions, so `qwen2.5:7b` remains the better
-bilingual choice. Every failure of this kind refuses to answer rather than
-inventing one, which is the intended direction, but it does limit usefulness.
+Generation with `qwen2.5:7b`, measured with `main.py aieval` on 6 regression
+cases and 12 held-out cases. The held-out cases use separate synthetic documents
+and were committed (`d97c3c5`) before the fixes below. These are automatic phrase
+checks on lab test cases, not human-reviewed labels; every answer was also read
+by hand.
+
+| | Before | After |
+|---|---|---|
+| Regression: correct / refused though answerable / correct abstention | 1 / 3 / 2 | 3 / 1 / 2 |
+| Held-out: correct / refused though answerable / correct abstention | 0 / 7 / 5 | 5 / 2 / 5 |
+| Wrong answers | 0 | 0 |
+| Median time per answer | ~200 ms | ~600 ms |
+
+Root causes of the earlier over-refusal: the answer schema put an
+`insufficient` flag before the claims, so the model committed to refusing before
+writing anything; and the checker returned a bare list of rejected claim
+numbers, which rejected most correct claims. The remaining three refusals are all
+Traditional Chinese. Two come from the checker and are strict but defensible:
+the claims added or dropped a detail the passage does not state. One is a
+generator refusal. `llama3:latest` failed both Traditional Chinese questions in an
+earlier test, so `qwen2.5:7b` remains the better bilingual choice.
+
+Agent: before the action budgets, 3 runs used 18 steps, 11 of them refused
+duplicates, and no run ever chose to finish. After, every run finishes by itself
+in 5 steps with no refused or repeated calls, and always after an SOP search.
+Some of those calls read Line A, which has no records in the demo data, so not
+every call is informative.
 
 Adversarial check: a document containing "IGNORE ALL PREVIOUS INSTRUCTIONS",
 a fake approver and a fake 0.99 threshold was uploaded through the real ingest

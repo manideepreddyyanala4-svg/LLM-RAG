@@ -21,7 +21,7 @@ from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 from retrieval import search_documents, search_bilingual, search_bm25, search_vectors, hybrid_search, current_evidence, words
 from evaluation import evaluate_questions, compare_searches, review_label, read_verified_questions
 from investigation import summarize_metrics, investigation_report, prepare_ticket, list_tickets, change_ticket, ticket_history
-from ollama_client import ask_ollama, embed_texts, build_grounded_prompt, list_ollama_models, grounded_answer, cited_passages, check_claims
+from ollama_client import ask_ollama, embed_texts, build_grounded_prompt, list_ollama_models, grounded_answer, check_claims
 from database import embedding_cache, save_embeddings, save_ai_run, list_ai_runs
 import rag
 from fastapi.testclient import TestClient
@@ -1392,47 +1392,179 @@ class RagTests(unittest.TestCase):
             rag.retrieve("question", "magic", documents=[], config={})
 
     def test_agent_may_not_use_an_unapproved_tool_or_approve_anything(self):
-        for bad in ({"tool": "approve_ticket"}, {"tool": "run_sql"}, {"tool": None},
-                    {"tool": "__import__"}, {}):
+        for bad in ("approve_ticket", "run_sql", None, "__import__", "", "finish",
+                    "read_inspection_metrics", "read_inspection_metrics:Z"):
             with self.assertRaises(ValueError):
-                rag.tool_arguments(bad, True)
+                rag.tool_arguments(bad, "question", True, [])
         # No state-changing approval tool exists at all, in either role.
         for forbidden in ("approve_ticket", "change_ticket", "approve", "reject_ticket",
                           "complete_ticket", "delete_document", "run_sql"):
             self.assertNotIn(forbidden, rag.AGENT_TOOLS)
+        for action in rag.ACTION_LIMITS:
+            self.assertIn(action.partition(":")[0], rag.AGENT_TOOLS)
         # The only tool that writes anything creates a pending draft a human must decide on.
         self.assertEqual([name for name in rag.AGENT_TOOLS if "ticket" in name],
                          ["prepare_incident_ticket"])
 
     def test_agent_draft_tool_needs_the_operator_role(self):
-        draft = {"tool": "prepare_incident_ticket", "tool_question": "Review Line B"}
         with self.assertRaises(ValueError):
-            rag.tool_arguments(draft, False)
-        name, arguments = rag.tool_arguments(draft, True)
-        self.assertEqual((name, arguments), ("prepare_incident_ticket", {"question": "Review Line B"}))
+            rag.tool_arguments("prepare_incident_ticket", "Review Line B", False, [])
+        self.assertNotIn("prepare_incident_ticket", rag.available_actions([], False))
+        self.assertEqual(rag.tool_arguments("prepare_incident_ticket", "Review Line B", True, []),
+                         ("prepare_incident_ticket", {"question": "Review Line B"}))
 
     def test_agent_may_prepare_only_one_draft_per_run(self):
-        draft = {"tool": "prepare_incident_ticket", "tool_question": "Review Line B"}
-        self.assertEqual(rag.tool_arguments(draft, True, False)[0], "prepare_incident_ticket")
+        used = ["prepare_incident_ticket"]
         with self.assertRaises(ValueError):
-            rag.tool_arguments(draft, True, True)
-        # A second read-only call is still fine after a draft exists.
-        self.assertEqual(rag.tool_arguments({"tool": "read_inspection_metrics", "line": "B"}, True, True)[0],
+            rag.tool_arguments("prepare_incident_ticket", "Review again", True, used)
+        self.assertNotIn("prepare_incident_ticket", rag.available_actions(used, True))
+        # A read-only call is still fine after a draft exists.
+        self.assertEqual(rag.tool_arguments("read_inspection_metrics:B", "", True, used)[0],
                          "read_inspection_metrics")
 
+    def test_agent_action_budget_shrinks_and_finish_needs_a_search(self):
+        self.assertNotIn("finish", rag.available_actions([], False))
+        self.assertNotIn("finish", rag.available_actions(["read_inspection_metrics:B"], False))
+        self.assertEqual(rag.available_actions(["search_approved_documents"], False)[-1], "finish")
+        used = ["read_inspection_metrics:B"]
+        self.assertNotIn("read_inspection_metrics:B", rag.available_actions(used, False))
+        self.assertIn("read_inspection_metrics:A", rag.available_actions(used, False))
+        with self.assertRaises(ValueError):
+            rag.tool_arguments("read_inspection_metrics:B", "", False, used)
+        used = ["search_approved_documents"]
+        self.assertIn("search_approved_documents", rag.available_actions(used, False))
+        used.append("search_approved_documents")
+        self.assertNotIn("search_approved_documents", rag.available_actions(used, False))
+        everything = []
+        for action, limit in rag.ACTION_LIMITS.items():
+            everything.extend([action] * limit)
+        self.assertEqual(rag.available_actions(everything, True), ["finish"])
+
     def test_agent_tool_arguments_are_validated(self):
-        for line in ("Z", "", None, "a"):
-            with self.assertRaises(ValueError):
-                rag.tool_arguments({"tool": "read_inspection_metrics", "line": line}, True)
-        self.assertEqual(rag.tool_arguments({"tool": "read_inspection_metrics", "line": "B"}, True),
+        self.assertEqual(rag.tool_arguments("read_inspection_metrics:B", "", True, []),
                          ("read_inspection_metrics", {"line": "B"}))
-        self.assertEqual(rag.tool_arguments({"tool": "compare_model_deployments", "line": "A"}, True),
+        self.assertEqual(rag.tool_arguments("compare_model_deployments:A", "ignored", True, []),
                          ("compare_model_deployments", {"line": "A"}))
         for question in ("", "   ", None, 5, "x" * 1001):
             with self.assertRaises(ValueError):
-                rag.tool_arguments({"tool": "search_approved_documents", "tool_question": question}, True)
-        self.assertEqual(rag.tool_arguments({"tool": "search_approved_documents", "tool_question": " shift "}, True),
+                rag.tool_arguments("search_approved_documents", question, True, [])
+        self.assertEqual(rag.tool_arguments("search_approved_documents", " shift ", True, []),
                          ("search_approved_documents", {"question": "shift"}))
+
+    def test_agent_loop_enforces_every_limit_in_python(self):
+        from types import SimpleNamespace
+        made = []
+
+        class FakeClient:
+            def __init__(self, settings):
+                self.settings = settings
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *details):
+                return False
+
+            async def list_tools(self):
+                return SimpleNamespace(tools=[SimpleNamespace(name=name) for name in rag.AGENT_TOOLS])
+
+            async def call_tool(self, name, arguments, read_timeout_seconds=None):
+                made.append((name, arguments))
+                return SimpleNamespace(structured_content={"tool": name}, is_error=False, content=[])
+
+        # A scripted planner that ignores the offered list, as a hostile model might.
+        script = [{"action": "approve_ticket", "tool_question": ""},
+                  {"action": "finish", "tool_question": ""},
+                  {"action": "read_inspection_metrics:B", "tool_question": ""},
+                  {"action": "read_inspection_metrics:B", "tool_question": ""},
+                  {"action": "prepare_incident_ticket", "tool_question": "Review Line B"},
+                  {"action": "search_approved_documents", "tool_question": "threshold"},
+                  {"action": "finish", "tool_question": ""}]
+        offered = []
+
+        def scripted(request, steps, actions, config):
+            offered.append(list(actions))
+            return script.pop(0), 1.0
+
+        # Room for every scripted step, so the loop reaches the final finish.
+        with patch.object(rag, "Client", FakeClient), patch.object(rag, "next_step", scripted), \
+             patch.object(rag, "MAX_STEPS", 10):
+            trace = asyncio.run(rag.call_tools("Investigate Line B", False, {}))
+        self.assertEqual(made, [("read_inspection_metrics", {"line": "B"}),
+                                ("search_approved_documents", {"question": "threshold"})])
+        refused = [step["output"] for step in trace["steps"] if not step["ok"]]
+        self.assertEqual(len(refused), 4)
+        for text in refused:
+            self.assertTrue(text.startswith("Refused by application code"))
+        self.assertNotIn("prepare_incident_ticket", offered[0])
+        self.assertNotIn("finish", offered[1])
+        self.assertNotIn("read_inspection_metrics:B", offered[3])
+        self.assertIn("finish", offered[-1])
+        self.assertEqual(trace["stopped"], "model finished")
+        self.assertEqual(len(trace["steps"]), 6)
+
+    def test_agent_step_limit_holds_against_a_planner_that_never_stops(self):
+        from types import SimpleNamespace
+
+        class FakeClient:
+            def __init__(self, settings):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *details):
+                return False
+
+            async def list_tools(self):
+                return SimpleNamespace(tools=[])
+
+            async def call_tool(self, name, arguments, read_timeout_seconds=None):
+                raise AssertionError("no tool may run")
+
+        planned = []
+
+        def stubborn(request, steps, actions, config):
+            planned.append(1)
+            return {"action": "approve_ticket", "tool_question": ""}, 1.0
+
+        with patch.object(rag, "Client", FakeClient), patch.object(rag, "next_step", stubborn):
+            trace = asyncio.run(rag.call_tools("Investigate", True, {}))
+        self.assertEqual(trace["stopped"], "step limit reached")
+        self.assertEqual(len(trace["steps"]), rag.MAX_STEPS)
+        self.assertEqual(len(planned), rag.MAX_STEPS)
+
+    def test_agent_stops_without_a_model_call_when_every_action_is_used(self):
+        from types import SimpleNamespace
+
+        class FakeClient:
+            def __init__(self, settings):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *details):
+                return False
+
+            async def list_tools(self):
+                return SimpleNamespace(tools=[])
+
+            async def call_tool(self, name, arguments, read_timeout_seconds=None):
+                return SimpleNamespace(structured_content={"n": len(arguments)}, is_error=False, content=[])
+
+        script = [{"action": "read_inspection_metrics:A", "tool_question": ""},
+                  {"action": "read_inspection_metrics:B", "tool_question": ""},
+                  {"action": "compare_model_deployments:A", "tool_question": ""},
+                  {"action": "compare_model_deployments:B", "tool_question": ""},
+                  {"action": "search_approved_documents", "tool_question": "one"},
+                  {"action": "search_approved_documents", "tool_question": "two"}]
+        with patch.object(rag, "Client", FakeClient), patch.object(rag, "MAX_STEPS", 10), \
+             patch.object(rag, "next_step", lambda *args: (script.pop(0), 1.0)):
+            trace = asyncio.run(rag.call_tools("Investigate", False, {}))
+        self.assertEqual(trace["stopped"], "every approved action used")
+        self.assertEqual(len(trace["steps"]), 6)
+        self.assertEqual(script, [])
 
     def test_agent_tool_process_never_receives_the_approval_secret(self):
         with patch.dict(os.environ, {"EVIDENCEOPS_TOKEN": "access", "EVIDENCEOPS_OPERATOR_TOKEN": "operator",
@@ -1460,12 +1592,73 @@ class RagTests(unittest.TestCase):
         plain = MagicMock(text="not json")
         self.assertEqual(rag.tool_output(MagicMock(structured_content=None, content=[plain])), "not json")
 
-    def test_cited_passages_sends_only_the_passages_a_claim_cites(self):
-        context = [{"citation_id": "E1", "text": "one"}, {"citation_id": "E2", "text": "two"},
-                   {"citation_id": "E3", "text": "three"}]
-        claims = [{"text": "a", "citation": "E3"}, {"text": "b", "citation": "E1"}]
-        passages = cited_passages(claims, context)
-        self.assertEqual([row["citation_id"] for row in passages], ["E1", "E3"])
+    def test_each_claim_is_checked_against_only_its_cited_passage(self):
+        config = {"endpoint": "http://127.0.0.1:11434", "model": "fake", "timeout": 10}
+        claims = [{"text": "Threshold is 0.50.", "citation": "E2", "quote": "Threshold is 0.50."}]
+        checked = []
+
+        def fake_chat(messages, config, schema=None, tools=None):
+            if "claims" in schema["properties"]:
+                return {"message": {"content": json.dumps({"claims": claims})}, "elapsed_ms": 1.0}
+            checked.append(json.loads(messages[1]["content"]))
+            return {"message": {"content": json.dumps({"passage_words": "0.50", "supported": True})},
+                    "elapsed_ms": 2.0}
+
+        evidence = [{"source": "deployments.csv", "location": "record 1", "text": "threshold 0.40, historical"},
+                    {"source": "sop_v2_en.txt", "location": "paragraph 2", "text": "Threshold is 0.50."}]
+        with patch("ollama_client.chat_ollama", fake_chat):
+            result = grounded_answer("What is the threshold?", evidence, config)
+        self.assertEqual(result["status"], "answered")
+        self.assertEqual(len(checked), 1)
+        self.assertEqual(checked[0]["passage"], "Threshold is 0.50.")
+        self.assertNotIn("0.40", json.dumps(checked[0]))
+        self.assertEqual(result["verification_ms"], 2.0)
+
+    def test_checker_rejection_withholds_the_whole_answer(self):
+        config = {"endpoint": "http://127.0.0.1:11434", "model": "fake", "timeout": 10}
+        claims = [{"text": "Threshold is 0.50.", "citation": "E1", "quote": "Threshold is 0.50."},
+                  {"text": "Every line uses 0.50.", "citation": "E1", "quote": "Threshold is 0.50."}]
+        verdicts = [True, False]
+
+        def fake_chat(messages, config, schema=None, tools=None):
+            if "claims" in schema["properties"]:
+                return {"message": {"content": json.dumps({"claims": claims})}, "elapsed_ms": 1.0}
+            return {"message": {"content": json.dumps({"passage_words": "x", "supported": verdicts.pop(0)})},
+                    "elapsed_ms": 1.0}
+
+        evidence = [{"source": "sop_v2_en.txt", "location": "paragraph 2", "text": "Threshold is 0.50."}]
+        with patch("ollama_client.chat_ollama", fake_chat):
+            result = grounded_answer("What is the threshold?", evidence, config)
+        self.assertEqual(result["status"], "withheld")
+        self.assertEqual(result["unsupported_claims"], [2])
+        self.assertEqual(result["claims"], [])
+        self.assertEqual(result["withheld_claims"], claims)
+        self.assertNotIn("Every line", result["answer"])
+
+    def test_empty_claims_abstain_and_skip_the_checker(self):
+        config = {"endpoint": "http://127.0.0.1:11434", "model": "fake", "timeout": 10}
+        calls = []
+
+        def fake_chat(messages, config, schema=None, tools=None):
+            calls.append(schema)
+            return {"message": {"content": json.dumps({"claims": []})}, "elapsed_ms": 1.0}
+
+        evidence = [{"source": "sop_v2_en.txt", "location": "paragraph 2", "text": "Threshold is 0.50."}]
+        with patch("ollama_client.chat_ollama", fake_chat):
+            result = grounded_answer("Who approved Line C?", evidence, config)
+        self.assertEqual(result["status"], "insufficient")
+        self.assertEqual(len(calls), 1)
+        # The answer schema has no separate refusal flag that could override real claims.
+        self.assertEqual(list(calls[0]["properties"]), ["claims"])
+
+    def test_malformed_generation_is_an_error_not_an_answer(self):
+        config = {"endpoint": "http://127.0.0.1:11434", "model": "fake", "timeout": 10}
+        evidence = [{"source": "sop_v2_en.txt", "location": "paragraph 2", "text": "Threshold is 0.50."}]
+        for content in ('{"insufficient": true}', '{"claims": "none"}', "not json", "[]"):
+            with patch("ollama_client.chat_ollama",
+                       lambda *args, **kwargs: {"message": {"content": content}, "elapsed_ms": 1.0}):
+                with self.assertRaises(RuntimeError):
+                    grounded_answer("What is the threshold?", evidence, config)
 
     def test_answer_language_follows_the_question_script(self):
         config = {"endpoint": "http://127.0.0.1:11434", "model": "fake", "timeout": 10}
@@ -1473,7 +1666,7 @@ class RagTests(unittest.TestCase):
 
         def fake_chat(messages, config, schema=None, tools=None):
             seen["system"] = messages[0]["content"]
-            return {"message": {"content": json.dumps({"insufficient": True, "claims": []})},
+            return {"message": {"content": json.dumps({"claims": []})},
                     "elapsed_ms": 1.0, "model": "fake", "eval_count": 1}
 
         evidence = [{"source": "sop_v2_en.txt", "location": "paragraph 2", "text": "Threshold is 0.50."}]
@@ -1490,7 +1683,7 @@ class RagTests(unittest.TestCase):
         claims = [{"text": "Threshold is 0.99.", "citation": "E1", "quote": "no such quote"}]
 
         def fake_chat(messages, config, schema=None, tools=None):
-            return {"message": {"content": json.dumps({"insufficient": False, "claims": claims})},
+            return {"message": {"content": json.dumps({"claims": claims})},
                     "elapsed_ms": 1.0, "model": "fake", "eval_count": 1}
 
         evidence = [{"source": "sop_v2_en.txt", "location": "paragraph 2", "text": "Threshold is 0.50."}]
