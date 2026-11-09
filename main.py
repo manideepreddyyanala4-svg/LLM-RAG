@@ -6,6 +6,7 @@ import sys
 import platform
 import shutil
 import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from data_io import DATA, ROOT, LOCAL, backup_local_databases, restore_local_databases, inspect_parquet, load_documents, read_csv
@@ -58,22 +59,92 @@ def print_answer(result):
     print("Note:", result["verification"])
 
 
-# Deterministic test cases written for this lab. These are NOT human-reviewed
-# benchmark labels: each one only names evidence that is present in the files.
-AI_TEST_CASES = [
-    {"id": "EN-THRESHOLD", "question": "What is the current Line B threshold?",
-     "expect_source": "sop_v2_en.txt", "language": "English"},
-    {"id": "ZH-THRESHOLD", "question": "目前 B 線的閾值是多少？",
-     "expect_source": "sop_v2_zh.txt", "language": "Traditional Chinese"},
-    {"id": "EN-CALIBRATION", "question": "What must be checked before changing settings?",
-     "expect_source": "sop_v2_en.txt", "language": "English"},
-    {"id": "ZH-CALIBRATION", "question": "更改設定前需要檢查什麼？",
-     "expect_source": "sop_v2_zh.txt", "language": "Traditional Chinese"},
-    {"id": "EN-ABSENT", "question": "Who approved the Line C deployment in 2019?",
-     "expect_source": None, "language": "English"},
-    {"id": "ZH-ABSENT", "question": "C 線在 2019 年由誰核准部署？",
-     "expect_source": None, "language": "Traditional Chinese"},
+# Deterministic test cases written for this lab. They are NOT human-reviewed
+# benchmark labels. kind "answer": the answer must contain every must_include
+# phrase. kind "abstain": the system must not answer. kind "trap": a false
+# premise; abstaining or giving the true fact are both acceptable.
+REGRESSION_CASES = [
+    {"id": "EN-THRESHOLD", "question": "What is the current Line B threshold?", "kind": "answer",
+     "must_include": ["0.50"], "expect_source": "sop_v2_en.txt"},
+    {"id": "ZH-THRESHOLD", "question": "目前 B 線的閾值是多少？", "kind": "answer",
+     "must_include": ["0.50"], "expect_source": "sop_v2_zh.txt"},
+    {"id": "EN-CALIBRATION", "question": "What must be checked before changing settings?", "kind": "answer",
+     "must_include": ["calibration"], "expect_source": "sop_v2_en.txt"},
+    {"id": "ZH-CALIBRATION", "question": "更改設定前需要檢查什麼？", "kind": "answer",
+     "must_include": ["校準"], "expect_source": "sop_v2_zh.txt"},
+    {"id": "EN-ABSENT", "question": "Who approved the Line C deployment in 2019?", "kind": "abstain"},
+    {"id": "ZH-ABSENT", "question": "C 線在 2019 年由誰核准部署？", "kind": "abstain"},
 ]
+
+# Held-out cases on separate synthetic documents. They were written before the
+# answer and checker changes and were not used to tune them. The documents stay
+# in memory only, so they never enter the document store or the dashboard.
+HELDOUT_TEXT = {
+    ("heldout_lens_en.txt", "ho-v1", "ACTIVE"): [
+        "Operators must wear anti-static gloves when handling camera lenses on Line A.",
+        "If more than three consecutive images are blurred, stop the line and notify the shift supervisor.",
+        "Lens cleaning is performed every 48 hours using isopropyl alcohol wipes.",
+    ],
+    ("heldout_lens_zh.txt", "ho-v1-zh", "有效"): [
+        "處理 A 線相機鏡頭時，操作員必須配戴防靜電手套。",
+        "連續超過三張影像模糊時，必須停止產線並通知當班主管。",
+        "相機鏡頭每 48 小時以異丙醇擦拭紙清潔一次。",
+        "鏡頭清潔紀錄必須保存一年。",
+    ],
+}
+HELDOUT_CASES = [
+    {"id": "HO-EN-CLEAN", "question": "How often are the camera lenses cleaned?", "kind": "answer",
+     "must_include": ["48"], "expect_source": "heldout_lens_en.txt"},
+    {"id": "HO-ZH-CLEAN", "question": "相機鏡頭多久清潔一次？", "kind": "answer",
+     "must_include": ["48"], "expect_source": "heldout_lens_zh.txt"},
+    {"id": "HO-EN-BLUR", "question": "What two things must happen when more than three consecutive images are blurred?",
+     "kind": "answer", "must_include": ["stop", "supervisor"], "expect_source": "heldout_lens_en.txt"},
+    {"id": "HO-ZH-BLUR", "question": "連續超過三張影像模糊時，必須做哪兩件事？", "kind": "answer",
+     "must_include": ["停止", "主管"], "expect_source": "heldout_lens_zh.txt"},
+    {"id": "HO-EN-GLOVES", "question": "What protective equipment is required when handling camera lenses?",
+     "kind": "answer", "must_include": ["static"], "expect_source": "heldout_lens_en.txt"},
+    {"id": "HO-ZH-GLOVES", "question": "處理相機鏡頭時需要配戴什麼？", "kind": "answer",
+     "must_include": ["防靜電"], "expect_source": "heldout_lens_zh.txt"},
+    # Stated only in the Chinese document: tests cross-lingual retrieval and answering.
+    {"id": "HO-EN-RECORDS", "question": "How long must lens cleaning records be kept?", "kind": "answer",
+     "must_include": ["year"], "expect_source": "heldout_lens_zh.txt"},
+    {"id": "HO-EN-ABSENT", "question": "What brand of camera is installed on Line A?", "kind": "abstain"},
+    {"id": "HO-ZH-ABSENT", "question": "A 線安裝的是哪個品牌的相機？", "kind": "abstain"},
+    {"id": "HO-EN-NEAR", "question": "How often are the conveyor belts replaced?", "kind": "abstain"},
+    {"id": "HO-ZH-NEAR", "question": "輸送帶多久更換一次？", "kind": "abstain"},
+    {"id": "HO-EN-PREMISE", "question": "Why are the lenses cleaned every 12 hours?", "kind": "trap",
+     "must_include": ["48"]},
+]
+AGENT_REQUESTS = [
+    "Investigate the Line B rejection increase against the SOP",
+    "Compare the Line B v3 and v4 deployments",
+    "B 線的拒收率為什麼上升？請調查。",
+]
+
+
+def heldout_documents():
+    """Turn the held-out text into evidence chunks shaped like load_documents output."""
+    documents = []
+    for (source, version, status), paragraphs in HELDOUT_TEXT.items():
+        for number, text in enumerate(paragraphs, 2):
+            documents.append({"source": source, "version": version, "status": status,
+                              "location": f"paragraph {number}", "text": text})
+    return documents
+
+
+def grade(case, result):
+    """Sort one real answer into a plain outcome. A human still reads the text."""
+    answered = result["status"] == "answered"
+    text = result["answer"].lower()
+    has_facts = True
+    for phrase in case.get("must_include", []):
+        if phrase.lower() not in text:
+            has_facts = False
+    if case["kind"] == "abstain":
+        return "wrongly_answered" if answered else "correct_abstention"
+    if not answered:
+        return "correct_abstention" if case["kind"] == "trap" else "false_refusal"
+    return "supported_correct" if has_facts else "answered_missing_fact"
 
 
 def hardware_facts():
@@ -96,70 +167,127 @@ def hardware_facts():
     return facts
 
 
-def run_ai_evaluation():
-    """Run every method and every test case against the real local models."""
-    from rag import answer_question, compare_methods, run_agent, ai_status, evidence_documents
-    report = {"recorded_at_utc": datetime.now(timezone.utc).isoformat(),
-              "hardware": hardware_facts(), "ai_status": ai_status(),
-              "labels": "Deterministic lab test cases. Not human-reviewed benchmark labels. "
-                        "expect_source only records which file holds the evidence.",
-              "retrieval": [], "answers": [], "agent": None, "errors": []}
-    documents = evidence_documents()
-    for case in AI_TEST_CASES:
+def median(values):
+    """Middle value of a list, or None for an empty list."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    return ordered[len(ordered) // 2]
+
+
+def answer_cases(name, cases, documents, report):
+    """Answer each case with real models and record the graded outcome."""
+    from rag import answer_question
+    for case in cases:
+        started = time.monotonic()
         try:
-            comparison = compare_methods(case["question"], documents)
+            result = answer_question(case["question"], "hybrid", documents)
         except (RuntimeError, ValueError, OSError) as error:
-            report["errors"].append({"case": case["id"], "stage": "retrieval", "error": str(error)})
+            report["errors"].append({"case": case["id"], "stage": "answer", "error": str(error)})
             continue
-        for row in comparison["comparison"]:
-            sources = [hit["source"] for hit in row["ranking"]]
-            found = None
-            if case["expect_source"]:
-                found = case["expect_source"] in sources
-            report["retrieval"].append({
-                "case": case["id"], "language": case["language"], "method": row["method"],
-                "ranked_sources": sources, "source_ids": row["source_ids"],
-                "expected_source_in_top3": found, "retrieval_ms": row["retrieval_ms"],
-                "index_ms": row["index_ms"]})
-    for case in AI_TEST_CASES:
-        try:
-            answer = answer_question(case["question"], "hybrid")
-        except (RuntimeError, ValueError, OSError) as error:
-            report["errors"].append({"case": case["id"], "stage": "generation", "error": str(error)})
-            continue
+        sources = [row["source"] for row in result["evidence"]]
         report["answers"].append({
-            "case": case["id"], "language": case["language"], "question": case["question"],
-            "status": answer["status"], "answer": answer["answer"],
-            "claims": answer["claims"], "withheld_claims": answer.get("withheld_claims", []),
-            "cited_source_ids": [row.get("source_id") for row in answer["evidence"]],
-            "citation_errors": answer["citation_errors"],
-            "unsupported_claims": answer["unsupported_claims"],
-            "evidence_sufficient": answer["status"] != "insufficient",
-            "expected_evidence_present": case["expect_source"] is not None,
-            "inference_ms": answer["inference_ms"], "verification_ms": answer["verification_ms"],
-            "retrieval_ms": answer["retrieval_ms"], "run_id": answer["run_id"]})
-    report["repeatability"] = []
-    for case in AI_TEST_CASES[:4]:
+            "set": name, "case": case["id"], "kind": case["kind"], "question": case["question"],
+            "outcome": grade(case, result), "status": result["status"], "answer": result["answer"],
+            "claims": result["claims"], "withheld_claims": result.get("withheld_claims", []),
+            "retrieved_sources": sources,
+            "expected_source_retrieved": case.get("expect_source") in sources if case.get("expect_source") else None,
+            "citation_errors": result["citation_errors"], "unsupported_claims": result["unsupported_claims"],
+            "retrieval_ms": result["retrieval_ms"], "inference_ms": result["inference_ms"],
+            "verification_ms": result["verification_ms"],
+            "total_ms": round((time.monotonic() - started) * 1000, 2)})
+
+
+def agent_efficiency(request, result):
+    """Count useful, refused and repeated tool calls in one real agent run."""
+    executed = 0
+    refused = 0
+    repeated = 0
+    outputs = []
+    for step in result["steps"]:
+        if str(step["output"]).startswith("Refused by application code"):
+            refused += 1
+            continue
+        executed += 1
+        text = json.dumps(step["output"], sort_keys=True, ensure_ascii=False)
+        if text in outputs:
+            repeated += 1
+        outputs.append(text)
+    return {"request": request, "steps_used": result["steps_used"], "step_limit": result["step_limit"],
+            "stopped_because": result["stopped_because"], "executed_calls": executed,
+            "refused_calls": refused, "repeated_outputs": repeated,
+            "useful_calls": executed - repeated, "planning_ms": result["planning_ms"],
+            "calls": [f"{step['tool']} {json.dumps(step['arguments'], ensure_ascii=False)} ok={step['ok']}"
+                      for step in result["steps"]],
+            "draft_created": result["ticket"], "summary_status": result["status"]}
+
+
+def summarize(report):
+    """Count outcomes per case set and collect median latencies."""
+    summary = {}
+    for row in report["answers"]:
+        group = summary.setdefault(row["set"], {"outcomes": {}, "inference_ms": [], "total_ms": []})
+        group["outcomes"][row["outcome"]] = group["outcomes"].get(row["outcome"], 0) + 1
+        group["inference_ms"].append(row["inference_ms"])
+        group["total_ms"].append(row["total_ms"])
+    for group in summary.values():
+        group["median_inference_ms"] = median(group.pop("inference_ms"))
+        group["median_total_ms"] = median(group.pop("total_ms"))
+    agent = report["agent"]
+    if agent:
+        summary["agent"] = {"runs": len(agent),
+                            "steps_used": sum(run["steps_used"] for run in agent),
+                            "useful_calls": sum(run["useful_calls"] for run in agent),
+                            "refused_calls": sum(run["refused_calls"] for run in agent),
+                            "repeated_outputs": sum(run["repeated_outputs"] for run in agent),
+                            "finished_by_model": sum(run["stopped_because"] == "model finished" for run in agent)}
+    return summary
+
+
+def run_ai_evaluation():
+    """Run regression and held-out cases, retrieval comparisons and the agent with real models."""
+    from rag import answer_question, compare_methods, run_agent, ai_status, evidence_documents
+    commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, cwd=ROOT)
+    report = {"recorded_at_utc": datetime.now(timezone.utc).isoformat(),
+              "git_commit": commit.stdout.decode().strip() or None,
+              "hardware": hardware_facts(), "ai_status": ai_status(),
+              "labels": "Deterministic lab test cases, not human-reviewed benchmark labels. Outcomes use "
+                        "automatic phrase checks; a person must still read each answer.",
+              "retrieval": [], "answers": [], "repeatability": [], "agent": [], "errors": []}
+    documents = evidence_documents()
+    with_heldout = documents + heldout_documents()
+    for name, cases, chunks in (("regression", REGRESSION_CASES, documents),
+                                ("heldout", HELDOUT_CASES, with_heldout)):
+        for case in cases:
+            if not case.get("expect_source"):
+                continue
+            try:
+                comparison = compare_methods(case["question"], chunks)
+            except (RuntimeError, ValueError, OSError) as error:
+                report["errors"].append({"case": case["id"], "stage": "retrieval", "error": str(error)})
+                continue
+            for row in comparison["comparison"]:
+                sources = [hit["source"] for hit in row["ranking"]]
+                report["retrieval"].append({"set": name, "case": case["id"], "method": row["method"],
+                                            "ranked_sources": sources,
+                                            "expected_source_in_top3": case["expect_source"] in sources,
+                                            "retrieval_ms": row["retrieval_ms"]})
+        answer_cases(name, cases, chunks, report)
+    for case in REGRESSION_CASES[:4]:
         statuses = []
         for _ in range(3):
             try:
-                statuses.append(answer_question(case["question"], "hybrid")["status"])
+                statuses.append(answer_question(case["question"], "hybrid", documents)["status"])
             except (RuntimeError, ValueError, OSError) as error:
                 statuses.append(f"error: {error}")
-        report["repeatability"].append({"case": case["id"], "runs": 3, "statuses": statuses,
+        report["repeatability"].append({"case": case["id"], "statuses": statuses,
                                         "identical": len(set(statuses)) == 1})
-    try:
-        agent = run_agent("Investigate the Line B rejection increase against the SOP", False)
-        report["agent"] = {"steps_used": agent["steps_used"], "step_limit": agent["step_limit"],
-                           "stopped_because": agent["stopped_because"],
-                           "tools_approved": agent["tools_approved"],
-                           "calls": [{"tool": step["tool"], "arguments": step["arguments"],
-                                      "ok": step["ok"],
-                                      "output": str(step["output"])[:300]} for step in agent["steps"]],
-                           "draft_created": agent["ticket"], "summary_status": agent["status"],
-                           "planning_ms": agent["planning_ms"]}
-    except (RuntimeError, ValueError, OSError) as error:
-        report["errors"].append({"case": "agent", "stage": "agent", "error": str(error)})
+    for request in AGENT_REQUESTS:
+        try:
+            report["agent"].append(agent_efficiency(request, run_agent(request, False)))
+        except (RuntimeError, ValueError, OSError) as error:
+            report["errors"].append({"case": request, "stage": "agent", "error": str(error)})
+    report["summary"] = summarize(report)
     LOCAL.mkdir(parents=True, exist_ok=True)
     (LOCAL / "ai_evaluation.json").write_text(json.dumps(report, ensure_ascii=False, indent=2),
                                               encoding="utf-8")
@@ -211,7 +339,9 @@ def main():
                 print_answer(result)
                 return 0
             report = run_ai_evaluation()
-            print(json.dumps(report, ensure_ascii=False, indent=2))
+            print(json.dumps(report["summary"], ensure_ascii=False, indent=2))
+            if report["errors"]:
+                print("Errors:", json.dumps(report["errors"], ensure_ascii=False))
             print("\nSaved to:", LOCAL / "ai_evaluation.json")
             return 0
         if args.action == "inspect":

@@ -148,10 +148,11 @@ def compare_methods(question, documents=None, config=None):
             "note": "Rankings and timings only. No accuracy score is claimed without human-reviewed labels."}
 
 
-def answer_question(question, method="hybrid"):
+def answer_question(question, method="hybrid", documents=None):
     """Question -> retrieve -> build context -> generate -> verify citations -> save."""
     config = ai_settings()
-    documents = evidence_documents()
+    if documents is None:
+        documents = evidence_documents()
     retrieval = retrieve(question, method, documents, config)
     evidence = []
     for row in retrieval["results"]:
