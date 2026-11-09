@@ -29,7 +29,7 @@ ACTION_HELP = {"search_approved_documents": "search current SOP evidence (needs 
                "read_inspection_metrics:B": "inspected/rejected totals for line B",
                "compare_model_deployments:A": "deployment records for line A",
                "compare_model_deployments:B": "deployment records for line B",
-               "prepare_incident_ticket": "save a PENDING draft a human must approve (needs tool_question)",
+               "prepare_incident_ticket": "save a PENDING draft of this request that a human must approve",
                "finish": "stop; the results so far are enough"}
 
 
@@ -210,15 +210,16 @@ def server_settings(allow_draft):
 
 def available_actions(used, allow_draft):
     """List the actions that still have budget left in this run, plus finish."""
+    searched = "search_approved_documents" in used
     actions = []
     for action, limit in ACTION_LIMITS.items():
-        if action == "prepare_incident_ticket" and not allow_draft:
+        if action == "prepare_incident_ticket" and not (allow_draft and searched):
             continue
         if used.count(action) < limit:
             actions.append(action)
-    # The findings must cite SOP evidence, so finish is offered only after a search.
-    # The model ignored this rule when it was only written in the prompt.
-    if "search_approved_documents" in used:
+    # Findings must cite SOP evidence, so a draft and finish are offered only after
+    # a search. The model ignored this rule when it was only written in the prompt.
+    if searched:
         actions.append("finish")
     return actions
 
@@ -312,12 +313,21 @@ async def call_tools(request, allow_draft, config):
                 break
             choice, elapsed = next_step(request, steps, actions, config)
             planning_ms += elapsed
-            if choice["action"] == "finish" and "finish" in actions:
+            # The model may only pick from this step's list. Anything else is refused
+            # here, even if the model ignores the list it was given.
+            if choice["action"] not in actions:
+                steps.append({"tool": choice["action"], "arguments": {}, "ok": False,
+                              "output": "Refused by application code: action not offered at this step"})
+                continue
+            if choice["action"] == "finish":
                 stopped = "model finished"
                 break
+            question = choice.get("tool_question")
+            if choice["action"] == "prepare_incident_ticket":
+                # The draft records what the person asked for, not text the model wrote.
+                question = request
             try:
-                name, arguments = tool_arguments(choice["action"], choice.get("tool_question"),
-                                                 allow_draft, used)
+                name, arguments = tool_arguments(choice["action"], question, allow_draft, used)
             except ValueError as error:
                 steps.append({"tool": choice["action"], "arguments": {}, "ok": False,
                               "output": f"Refused by application code: {error}"})

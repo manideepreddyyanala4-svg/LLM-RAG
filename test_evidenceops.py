@@ -1400,6 +1400,10 @@ class RagTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             rag.tool_arguments("prepare_incident_ticket", "Review Line B", False, [])
         self.assertNotIn("prepare_incident_ticket", rag.available_actions([], False))
+        self.assertNotIn("prepare_incident_ticket", rag.available_actions(["search_approved_documents"], False))
+        # Even with the operator role, a draft is offered only after an SOP search.
+        self.assertNotIn("prepare_incident_ticket", rag.available_actions([], True))
+        self.assertIn("prepare_incident_ticket", rag.available_actions(["search_approved_documents"], True))
         self.assertEqual(rag.tool_arguments("prepare_incident_ticket", "Review Line B", True, []),
                          ("prepare_incident_ticket", {"question": "Review Line B"}))
 
@@ -1492,6 +1496,39 @@ class RagTests(unittest.TestCase):
         self.assertIn("finish", offered[-1])
         self.assertEqual(trace["stopped"], "model finished")
         self.assertEqual(len(trace["steps"]), 6)
+
+    def test_agent_draft_records_the_request_not_model_text(self):
+        from types import SimpleNamespace
+        made = []
+
+        class FakeClient:
+            def __init__(self, settings):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *details):
+                return False
+
+            async def list_tools(self):
+                return SimpleNamespace(tools=[])
+
+            async def call_tool(self, name, arguments, read_timeout_seconds=None):
+                made.append((name, arguments))
+                return SimpleNamespace(structured_content={"id": 1, "state": "pending"}, is_error=False, content=[])
+
+        script = [{"action": "prepare_incident_ticket", "tool_question": "What is the priority?"},
+                  {"action": "search_approved_documents", "tool_question": "threshold"},
+                  {"action": "prepare_incident_ticket", "tool_question": "What is the priority?"},
+                  {"action": "finish", "tool_question": ""}]
+        with patch.object(rag, "Client", FakeClient), \
+             patch.object(rag, "next_step", lambda *args: (script.pop(0), 1.0)):
+            trace = asyncio.run(rag.call_tools("Investigate the Line B rejection increase", True, {}))
+        self.assertEqual(made, [("search_approved_documents", {"question": "threshold"}),
+                                ("prepare_incident_ticket",
+                                 {"question": "Investigate the Line B rejection increase"})])
+        self.assertFalse(trace["steps"][0]["ok"])
 
     def test_agent_step_limit_holds_against_a_planner_that_never_stops(self):
         from types import SimpleNamespace
