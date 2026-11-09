@@ -236,14 +236,26 @@ def looks_like_instructions(text):
     return False
 
 
+def is_claim_shape(claim):
+    """True if a claim is a dictionary with text, citation and quote strings."""
+    if not isinstance(claim, dict):
+        return False
+    for key in ("text", "citation", "quote"):
+        if not isinstance(claim.get(key), str):
+            return False
+    return True
+
+
 def check_claims(claims, evidence):
     """Check citation identity and exact supporting quotes before any display."""
-    known = {row["citation_id"]: row for row in evidence}
+    known = {}
+    for row in evidence:
+        known[row["citation_id"]] = row
     errors = []
     if not isinstance(claims, list) or not 1 <= len(claims) <= 6:
         return ["The answer has no bounded, cited claims"]
     for number, claim in enumerate(claims, 1):
-        if not isinstance(claim, dict) or not all(isinstance(claim.get(k), str) for k in ("text", "citation", "quote")):
+        if not is_claim_shape(claim):
             errors.append(f"Claim {number} has an invalid structure")
             continue
         row = known.get(claim["citation"])

@@ -62,7 +62,9 @@ def build_index(documents, config, rebuild=False):
     added = {}
     for start in range(0, len(missing), BATCH):
         batch = missing[start:start + BATCH]
-        texts = [wanted[key] for key in batch]
+        texts = []
+        for key in batch:
+            texts.append(wanted[key])
         result = embed_texts(texts, config["endpoint"], config["embedding_model"], True, config["timeout"])
         if "error" in result:
             raise RuntimeError("Embedding failed: " + result["error"])
@@ -145,7 +147,9 @@ def retrieve(question, method="hybrid", documents=None, config=None):
             results = hybrid_search(documents, question, vector_search)
     report["retrieval_ms"] = round((time.monotonic() - started) * 1000, 2)
     report["results"] = results
-    report["source_ids"] = [source_id(row) for row in results]
+    report["source_ids"] = []
+    for row in results:
+        report["source_ids"].append(source_id(row))
     return report
 
 
@@ -424,5 +428,8 @@ def ai_status():
     status["chunks"] = len(documents)
     status["vectors_cached"] = len(cached)
     status["chunks_without_vectors"] = missing
-    status["dimensions"] = len(next(iter(cached.values()))) if cached else None
+    status["dimensions"] = None
+    for vector in cached.values():
+        status["dimensions"] = len(vector)  # every cached vector has the same size
+        break
     return status

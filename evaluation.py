@@ -16,7 +16,7 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
-from data_io import ROOT, read_csv
+from data_io import ROOT, read_csv, table_columns
 from retrieval import search_documents, search_bilingual, search_bm25
 from rag import answer_question, compare_methods, run_agent, ai_status, evidence_documents
 from steel_faults import steel_documents
@@ -24,29 +24,45 @@ from steel_faults import steel_documents
 REVIEW_SOURCES = ("sop_v1.txt", "sop_v2_en.txt", "sop_v2_zh.txt", "metrics.csv", "deployments.csv")
 
 
+def split_sources(text):
+    """Turn "a.txt; b.txt" into {"a.txt", "b.txt"}, skipping empty entries."""
+    sources = set()
+    for source in text.split(";"):
+        if source.strip():
+            sources.add(source.strip())
+    return sources
+
+
+def source_hits(expected, sources):
+    """(top1, top3): is an expected source ranked first, and is one anywhere in the top three?"""
+    top1 = len(sources) > 0 and sources[0] in expected
+    top3 = len(expected & set(sources)) > 0
+    return top1, top3
+
+
 def evaluate_questions(documents, questions, verified=False, search=search_documents):
     """Return counts and per-question results, or refuse unverified labels."""
     if not verified:
         raise ValueError("Human verification is not recorded. Review labels before confirming.")
-    report = dict(total=0, top1=0, top3=0, skipped=0, details=[])
+    report = {"total": 0, "top1": 0, "top3": 0, "skipped": 0, "details": []}
     for row in questions:
-        expected = set()
-        for source in row["expected_source"].split(";"):
-            if source.strip():
-                expected.add(source.strip())
+        expected = split_sources(row["expected_source"])
         if not expected or not row["question"].strip():
             report["skipped"] += 1
             continue
         results = search(documents, row["question"])
-        sources = [result["source"] for result in results]
-        first = bool(sources and sources[0] in expected)
-        any_hit = bool(expected & set(sources))
+        sources = []
+        for result in results:
+            sources.append(result["source"])
+        first, any_hit = source_hits(expected, sources)
         report["total"] += 1
-        report["top1"] += int(first)
-        report["top3"] += int(any_hit)
-        report["details"].append(dict(id=row["question_id"], question=row["question"],
-                                      expected=sorted(expected), results=results,
-                                      top1=first, top3=any_hit))
+        if first:
+            report["top1"] += 1
+        if any_hit:
+            report["top3"] += 1
+        report["details"].append({"id": row["question_id"], "question": row["question"],
+                                  "expected": sorted(expected), "results": results,
+                                  "top1": first, "top3": any_hit})
     if report["total"]:
         report["top1_percent"] = round(100 * report["top1"] / report["total"], 2)
         report["top3_percent"] = round(100 * report["top3"] / report["total"], 2)
@@ -61,7 +77,9 @@ def print_evaluation(report):
     total = report["total"]
     print(f"Total labeled questions tested: {total}; skipped: {report['skipped']}")
     for key in ("top1", "top3"):
-        percent = 100 * report[key] / total if total else 0
+        percent = 0
+        if total:
+            percent = 100 * report[key] / total
         print(f"{key}: {report[key]}/{total} ({percent:.1f}%)")
     print("Top-1 source accuracy; top-3 any-source hit rate (not full multi-source recall).")
     print("These measure source retrieval, not answer correctness or paragraph sufficiency.")
@@ -77,29 +95,28 @@ def compare_searches(documents, questions, log_file=None, reviewed_questions=Non
     rows = []
     methods = {"keyword": search_bilingual, "bm25": search_bm25}
     reviewed = {}
-    for question in reviewed_questions or []:
-        sources = set()
-        for source in question["expected_source"].split(";"):
-            if source.strip():
-                sources.add(source.strip())
-        reviewed[question["question_id"]] = sources
+    if reviewed_questions:
+        for question in reviewed_questions:
+            reviewed[question["question_id"]] = split_sources(question["expected_source"])
     for question in questions:
         for name, search in methods.items():
             start = time.perf_counter()
             results = search(documents, question["question"])
             elapsed_ms = round((time.perf_counter() - start) * 1000, 3)
             matches = []
-            for rank, result in enumerate(results, 1):
+            sources = []
+            rank = 0
+            for result in results:
+                rank += 1
                 matches.append({"rank": rank, "source": result["source"], "location": result["location"],
                                 "version": result.get("version"), "score": result["score"]})
+                sources.append(result["source"])
             expected = reviewed.get(question["question_id"])
             top1 = None
             top3 = None
             failure = None
             if expected is not None:
-                sources = [match["source"] for match in matches]
-                top1 = bool(sources and sources[0] in expected)
-                top3 = bool(expected & set(sources))
+                top1, top3 = source_hits(expected, sources)
                 if not top3:
                     failure = "reviewed source absent from top three"
                 elif not top1:
@@ -111,23 +128,28 @@ def compare_searches(documents, questions, log_file=None, reviewed_questions=Non
                          "reviewed": expected is not None, "top1": top1, "top3": top3,
                          "failure": failure})
     if log_file is not None:
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        evidence = []
-        for document in documents:
-            evidence.append([document["source"], document["location"], document["text"],
-                             document.get("version"), document.get("status"), document.get("hash")])
-        questions_used = []
-        for question in questions:
-            questions_used.append([question["question_id"], question["question"]])
-        evidence_hash = hashlib.sha256(json.dumps(evidence, ensure_ascii=False).encode("utf-8")).hexdigest()
-        questions_hash = hashlib.sha256(json.dumps(questions_used, ensure_ascii=False).encode("utf-8")).hexdigest()
-        record = {"recorded_at_utc": datetime.now(timezone.utc).isoformat(),
-                  "python": platform.python_version(), "backend": "local lexical search",
-                  "model": None, "evidence_sha256": evidence_hash,
-                  "questions_sha256": questions_hash, "results": rows}
-        with log_file.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        append_experiment_log(log_file, documents, questions, rows)
     return rows
+
+
+def append_experiment_log(log_file, documents, questions, rows):
+    """Add one JSON line recording the results plus fingerprints of the exact inputs."""
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    evidence = []
+    for document in documents:
+        evidence.append([document["source"], document["location"], document["text"],
+                         document.get("version"), document.get("status"), document.get("hash")])
+    questions_used = []
+    for question in questions:
+        questions_used.append([question["question_id"], question["question"]])
+    evidence_hash = hashlib.sha256(json.dumps(evidence, ensure_ascii=False).encode("utf-8")).hexdigest()
+    questions_hash = hashlib.sha256(json.dumps(questions_used, ensure_ascii=False).encode("utf-8")).hexdigest()
+    record = {"recorded_at_utc": datetime.now(timezone.utc).isoformat(),
+              "python": platform.python_version(), "backend": "local lexical search",
+              "model": None, "evidence_sha256": evidence_hash,
+              "questions_sha256": questions_hash, "results": rows}
+    with log_file.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def review_label(store, csv_file, question_id, expected_source):
@@ -140,9 +162,13 @@ def review_label(store, csv_file, question_id, expected_source):
             break
     if selected is None:
         raise ValueError("Unknown question ID")
-    sources = [source.strip() for source in expected_source.split(";")]
-    if not sources or any(source not in REVIEW_SOURCES for source in sources):
-        raise ValueError("Choose one or more approved source filenames")
+    # Stricter than split_sources: an empty entry such as a trailing ";" is an error here.
+    sources = []
+    for source in expected_source.split(";"):
+        source = source.strip()
+        if source not in REVIEW_SOURCES:
+            raise ValueError("Choose one or more approved source filenames")
+        sources.append(source)
     source_hashes = {}
     for source in sources:
         if not (csv_file.parent / source).is_file():
@@ -156,7 +182,7 @@ def review_label(store, csv_file, question_id, expected_source):
                 (question_id TEXT PRIMARY KEY, question TEXT NOT NULL,
                  expected_source TEXT NOT NULL, csv_hash TEXT NOT NULL,
                  source_hashes TEXT, reviewed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
-            columns = [row[1] for row in connection.execute("PRAGMA table_info(reviewed_labels)")]
+            columns = table_columns(connection, "reviewed_labels")
             if "source_hashes" not in columns:
                 connection.execute("ALTER TABLE reviewed_labels ADD COLUMN source_hashes TEXT")
             connection.execute("""INSERT INTO reviewed_labels
@@ -177,7 +203,7 @@ def read_verified_questions(store, csv_file):
     digest = hashlib.sha256(csv_file.read_bytes()).hexdigest()
     questions = read_csv(csv_file, ["question_id", "question", "expected_source"])
     with closing(sqlite3.connect(store, timeout=3)) as connection:
-        columns = [row[1] for row in connection.execute("PRAGMA table_info(reviewed_labels)")]
+        columns = table_columns(connection, "reviewed_labels")
         if "source_hashes" not in columns:
             return []  # Earlier reviews need a fresh evidence inspection.
         rows = connection.execute("""SELECT question_id, question, expected_source, csv_hash, source_hashes
@@ -192,7 +218,7 @@ def read_verified_questions(store, csv_file):
             continue
         if not isinstance(source_hashes, dict):
             continue
-        current_sources = {source.strip() for source in sources.split(";") if source.strip()}
+        current_sources = split_sources(sources)
         if not current_sources or not current_sources.issubset(set(REVIEW_SOURCES)):
             continue
         if current_sources != set(source_hashes):

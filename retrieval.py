@@ -24,6 +24,15 @@ def current_evidence(documents):
     return result
 
 
+def not_deleted(documents):
+    """Keep every version except deleted ones; used when old versions are asked for on purpose."""
+    result = []
+    for document in documents:
+        if document.get("status") != "DELETED":
+            result.append(document)
+    return result
+
+
 def english_word_list(text):
     """Lowercase English words without stop words, in order, repeats kept."""
     result = []

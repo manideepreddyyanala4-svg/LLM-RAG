@@ -21,9 +21,21 @@ DATA = Path(os.environ.get("EVIDENCEOPS_DATA_DIR", ROOT / "EvidenceOps_Data_Star
 if not DATA.is_absolute():
     raise ValueError("EVIDENCEOPS_DATA_DIR must be an absolute path")
 configured_local = os.environ.get("EVIDENCEOPS_LOCAL_DIR")
-LOCAL = Path(configured_local) if configured_local else ROOT / "data" / "local"
+if configured_local:
+    LOCAL = Path(configured_local)
+else:
+    LOCAL = ROOT / "data" / "local"
 if not LOCAL.is_absolute():
     raise ValueError("EVIDENCEOPS_LOCAL_DIR must be an absolute path")
+
+
+def table_columns(connection, table):
+    """The column names of one SQLite table (used to upgrade older databases safely)."""
+    names = []
+    # "table" is always a fixed name written in this code, never user input.
+    for row in connection.execute(f"PRAGMA table_info({table})"):
+        names.append(row[1])  # each row describes one column; position 1 is its name
+    return names
 
 
 def read_csv(path, required):
@@ -52,9 +64,18 @@ def read_csv(path, required):
     return rows
 
 
+def header_value(header, label):
+    """Read "LABEL: value" from an SOP header, or "unknown" if the label is missing."""
+    found = re.search(label + r"\s*[:：]\s*([^\n]+)", header)
+    if found:
+        return found.group(1).strip()
+    return "unknown"
+
+
 def load_documents(folder=None, include_csv=False, local_file=None, include_deleted=False):
     """Return source, location and text dictionaries for SOPs and optional CSVs."""
-    folder = DATA if folder is None else folder
+    if folder is None:
+        folder = DATA
     documents = []
     if not folder.is_dir():
         raise FileNotFoundError(f"Evidence folder missing: {folder}")
@@ -62,14 +83,16 @@ def load_documents(folder=None, include_csv=False, local_file=None, include_dele
         content = path.read_bytes()
         text = content.decode("utf-8-sig")
         header = text.split("\n\n", 1)[0]
-        version = re.search(r"(?:DOCUMENT ID|文件編號)\s*[:：]\s*([^\n]+)", header)
-        status = re.search(r"(?:STATUS|狀態)\s*[:：]\s*([^\n]+)", header)
+        version = header_value(header, r"(?:DOCUMENT ID|文件編號)")
+        status = header_value(header, r"(?:STATUS|狀態)")
         digest = hashlib.sha256(content).hexdigest()
-        for number, paragraph in enumerate(re.split(r"\n\s*\n", text), 1):
+        number = 0
+        for paragraph in re.split(r"\n\s*\n", text):  # paragraphs are separated by a blank line
+            number += 1
             if paragraph.strip():
-                documents.append(dict(source=path.name, location=f"paragraph {number}",
-                                      text=paragraph.strip(), version=version.group(1).strip() if version else "unknown",
-                                      status=status.group(1).strip() if status else "unknown", hash=digest))
+                documents.append({"source": path.name, "location": f"paragraph {number}",
+                                  "text": paragraph.strip(), "version": version, "status": status,
+                                  "hash": digest})
     if local_file is not None:
         documents.extend(read_local_documents(local_file, include_deleted))
     if include_csv:
@@ -92,7 +115,10 @@ def ingest_document(store, source, version, text, original=None):
         raise ValueError("Use a simple .txt filename")
     if not isinstance(text, str) or not text.strip():
         raise ValueError("Version and nonempty text (at most 100 KB) are required")
-    content = text.encode("utf-8") if original is None else original
+    if original is None:
+        content = text.encode("utf-8")
+    else:
+        content = original
     if not isinstance(content, bytes) or len(content) > 100_000:
         raise ValueError("Text file exceeds 100 KB")
     if content.decode("utf-8-sig") != text:
@@ -102,6 +128,11 @@ def ingest_document(store, source, version, text, original=None):
         if paragraph.strip():
             chunks.append((f"paragraph {number}", paragraph.strip()))
     return save_document(store, source, version, content, chunks)
+
+
+def page_number(chunk):
+    """Sort key for ("page 3", text): the number 3."""
+    return int(chunk[0].split()[1])
 
 
 def ingest_pdf(store, source, version, content):
@@ -126,8 +157,11 @@ def ingest_pdf(store, source, version, content):
             recognized = ocr_pdf_pages(content, scanned_pages, store)
             for number in scanned_pages:
                 chunks.append((f"page {number}", recognized[number]))
-        chunks.sort(key=lambda row: int(row[0].split()[1]))
-        if sum(len(text) for _, text in chunks) > 100_000:
+        chunks.sort(key=page_number)
+        total_characters = 0
+        for location, text in chunks:
+            total_characters += len(text)
+        if total_characters > 100_000:
             raise ValueError("Extracted PDF text exceeds 100 KB")
     except (OSError, KeyError, TypeError, PyPdfError) as error:
         raise ValueError(f"Cannot read PDF: {error}") from error
@@ -197,11 +231,7 @@ def save_document(store, source, version, content, chunks):
                 if previous[0] == digest:
                     raise ValueError("That version is inactive; use a new version name")
                 raise ValueError("That source/version already exists with different content")
-            old_ids = [row[0] for row in connection.execute(
-                "SELECT id FROM local_documents WHERE source=? AND status='CURRENT'", (source,))]
-            connection.execute("UPDATE local_documents SET status='OLD' WHERE source=? AND status='CURRENT'", (source,))
-            for document_id in old_ids:
-                record_document_event(connection, document_id, "superseded")
+            supersede_current(connection, source)
             cursor = connection.execute("""INSERT INTO local_documents (source, version, digest, status, content)
                 VALUES (?, ?, ?, 'CURRENT', ?)""", (source, version, digest, content))
             record_document_event(connection, cursor.lastrowid, "created")
@@ -211,16 +241,30 @@ def save_document(store, source, version, content, chunks):
     return {"status": "added", "hash": digest}
 
 
+def supersede_current(connection, source):
+    """Mark the current version of a source as OLD and record why. Call inside a transaction."""
+    old_ids = []
+    for row in connection.execute("SELECT id FROM local_documents WHERE source=? AND status='CURRENT'", (source,)):
+        old_ids.append(row[0])
+    connection.execute("UPDATE local_documents SET status='OLD' WHERE source=? AND status='CURRENT'", (source,))
+    for document_id in old_ids:
+        record_document_event(connection, document_id, "superseded")
+
+
 def setup_documents(connection, store):
-    """Create local tables and import a prior JSON store once, if present."""
+    """Create the local tables if needed, and import an older JSON store once, if present.
+
+    Everything happens in one transaction, so a failure changes nothing.
+    """
     with connection:
+        # BEGIN IMMEDIATE locks the database for writing, so two requests cannot set up at once.
         connection.execute("BEGIN IMMEDIATE")
         connection.execute("""CREATE TABLE IF NOT EXISTS local_documents
             (id INTEGER PRIMARY KEY, source TEXT NOT NULL, version TEXT NOT NULL,
              digest TEXT NOT NULL, status TEXT NOT NULL, content BLOB,
              UNIQUE(source, version))""")
-        columns = [row[1] for row in connection.execute("PRAGMA table_info(local_documents)")]
-        if "content" not in columns:
+        # Databases made by an older version have no "content" column yet.
+        if "content" not in table_columns(connection, "local_documents"):
             connection.execute("ALTER TABLE local_documents ADD COLUMN content BLOB")
         connection.execute("""CREATE TABLE IF NOT EXISTS local_chunks
             (document_id INTEGER NOT NULL, location TEXT NOT NULL, text TEXT NOT NULL,
@@ -230,49 +274,62 @@ def setup_documents(connection, store):
              action TEXT NOT NULL, event_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
         connection.execute("CREATE TABLE IF NOT EXISTS local_meta (key TEXT PRIMARY KEY)")
         legacy = store.with_suffix(".json")
-        if not legacy.exists() or connection.execute("SELECT 1 FROM local_meta WHERE key='legacy_imported'").fetchone():
-            return
-        rows = json.loads(legacy.read_text(encoding="utf-8"))
-        if not isinstance(rows, list):
-            raise ValueError("Malformed legacy document store")
-        for row in rows:
-            if not isinstance(row, dict) or not all(key in row for key in ("source", "version", "hash", "location", "text")):
-                raise ValueError("Malformed legacy document row")
-            if not all(isinstance(row[key], str) for key in ("source", "version", "hash", "location", "text")):
-                raise ValueError("Malformed legacy document values")
-            if not re.fullmatch(r"[a-zA-Z0-9_-]{1,50}\.txt", row["source"]):
-                raise ValueError("Malformed legacy source name")
-            if not re.fullmatch(r"[a-zA-Z0-9._-]{1,40}", row["version"]):
-                raise ValueError("Malformed legacy version")
-            if not re.fullmatch(r"[0-9a-f]{64}", row["hash"]):
-                raise ValueError("Malformed legacy document hash")
-            if not re.fullmatch(r"paragraph [1-9][0-9]*", row["location"]) or not row["text"].strip():
-                raise ValueError("Malformed legacy paragraph")
-            previous = connection.execute("SELECT id FROM local_documents WHERE source=? AND version=?",
-                                          (row["source"], row["version"])).fetchone()
-            if previous:
-                document_id = previous[0]
-                stored_hash = connection.execute("SELECT digest FROM local_documents WHERE id=?", (document_id,)).fetchone()[0]
-                if stored_hash != row["hash"]:
-                    raise ValueError("Conflicting legacy document hashes")
-            else:
-                old_ids = [item[0] for item in connection.execute(
-                    "SELECT id FROM local_documents WHERE source=? AND status='CURRENT'", (row["source"],))]
-                connection.execute("UPDATE local_documents SET status='OLD' WHERE source=? AND status='CURRENT'", (row["source"],))
-                for old_id in old_ids:
-                    record_document_event(connection, old_id, "superseded")
-                document_id = connection.execute("""INSERT INTO local_documents
-                    (source, version, digest, status) VALUES (?, ?, ?, 'CURRENT')""",
-                    (row["source"], row["version"], row["hash"])).lastrowid
-                record_document_event(connection, document_id, "imported")
-            old_chunk = connection.execute("SELECT text FROM local_chunks WHERE document_id=? AND location=?",
-                                           (document_id, row["location"])).fetchone()
-            if old_chunk and old_chunk[0] != row["text"]:
-                raise ValueError("Conflicting legacy paragraph")
-            if not old_chunk:
-                connection.execute("INSERT INTO local_chunks (document_id, location, text) VALUES (?, ?, ?)",
-                                   (document_id, row["location"], row["text"]))
-        connection.execute("INSERT INTO local_meta (key) VALUES ('legacy_imported')")
+        already_imported = connection.execute("SELECT 1 FROM local_meta WHERE key='legacy_imported'").fetchone()
+        if legacy.exists() and not already_imported:
+            import_legacy_json(connection, legacy)
+            connection.execute("INSERT INTO local_meta (key) VALUES ('legacy_imported')")
+
+
+def check_legacy_row(row):
+    """Reject a malformed row from the old documents.json store."""
+    if not isinstance(row, dict):
+        raise ValueError("Malformed legacy document row")
+    for key in ("source", "version", "hash", "location", "text"):
+        if key not in row:
+            raise ValueError("Malformed legacy document row")
+        if not isinstance(row[key], str):
+            raise ValueError("Malformed legacy document values")
+    if not re.fullmatch(r"[a-zA-Z0-9_-]{1,50}\.txt", row["source"]):
+        raise ValueError("Malformed legacy source name")
+    if not re.fullmatch(r"[a-zA-Z0-9._-]{1,40}", row["version"]):
+        raise ValueError("Malformed legacy version")
+    if not re.fullmatch(r"[0-9a-f]{64}", row["hash"]):
+        raise ValueError("Malformed legacy document hash")
+    if not re.fullmatch(r"paragraph [1-9][0-9]*", row["location"]) or not row["text"].strip():
+        raise ValueError("Malformed legacy paragraph")
+
+
+def import_legacy_json(connection, legacy):
+    """Copy paragraphs from an older documents.json store into SQLite.
+
+    Earlier versions of this project kept uploads in JSON. Any conflict stops the
+    whole import, and because this runs inside setup_documents' transaction,
+    nothing is half-imported.
+    """
+    rows = json.loads(legacy.read_text(encoding="utf-8"))
+    if not isinstance(rows, list):
+        raise ValueError("Malformed legacy document store")
+    for row in rows:
+        check_legacy_row(row)
+        previous = connection.execute("SELECT id, digest FROM local_documents WHERE source=? AND version=?",
+                                      (row["source"], row["version"])).fetchone()
+        if previous:
+            document_id = previous[0]
+            if previous[1] != row["hash"]:
+                raise ValueError("Conflicting legacy document hashes")
+        else:
+            supersede_current(connection, row["source"])
+            document_id = connection.execute("""INSERT INTO local_documents
+                (source, version, digest, status) VALUES (?, ?, ?, 'CURRENT')""",
+                (row["source"], row["version"], row["hash"])).lastrowid
+            record_document_event(connection, document_id, "imported")
+        old_chunk = connection.execute("SELECT text FROM local_chunks WHERE document_id=? AND location=?",
+                                       (document_id, row["location"])).fetchone()
+        if old_chunk and old_chunk[0] != row["text"]:
+            raise ValueError("Conflicting legacy paragraph")
+        if not old_chunk:
+            connection.execute("INSERT INTO local_chunks (document_id, location, text) VALUES (?, ?, ?)",
+                               (document_id, row["location"], row["text"]))
 
 
 def record_document_event(connection, document_id, action):
@@ -294,8 +351,11 @@ def read_local_documents(store, include_deleted=False):
             query += " WHERE d.status='CURRENT'"
         query += " ORDER BY d.id, c.location"
         rows = connection.execute(query).fetchall()
-    return [dict(source=row[0], version=row[1], hash=row[2], status=row[3],
-                 location=row[4], text=row[5], downloadable=bool(row[6])) for row in rows]
+    documents = []
+    for row in rows:
+        documents.append({"source": row[0], "version": row[1], "hash": row[2], "status": row[3],
+                          "location": row[4], "text": row[5], "downloadable": bool(row[6])})
+    return documents
 
 
 def delete_document(store, source, version):
@@ -352,7 +412,10 @@ def document_history(store, source, version):
             raise ValueError("Local document not found")
         events = connection.execute("""SELECT action, event_at FROM local_document_events
             WHERE document_id=? ORDER BY id""", (row[0],)).fetchall()
-    return [{"action": event[0], "at": event[1]} for event in events]
+    history = []
+    for event in events:
+        history.append({"action": event[0], "at": event[1]})
+    return history
 
 
 def read_document_file(store, source, version):

@@ -21,7 +21,10 @@ async def main():
     try:
         async with Client(settings) as client:
             tools = await asyncio.wait_for(client.list_tools(), timeout=10)
-            print("Available tools:", [tool.name for tool in tools.tools])
+            names = []
+            for tool in tools.tools:
+                names.append(tool.name)
+            print("Available tools:", names)
             result = await asyncio.wait_for(client.call_tool("search_approved_documents",
                                             {"question": "calibration records"},
                                             read_timeout_seconds=10), timeout=12)
