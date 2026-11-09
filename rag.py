@@ -48,7 +48,10 @@ def evidence_documents():
 def build_index(documents, config, rebuild=False):
     """Embed every chunk that has no cached vector for this exact model digest."""
     model_key = installed_model(config, embedding=True)
-    cached = {} if rebuild else embedding_cache(VECTORS, model_key)
+    if rebuild:
+        cached = {}
+    else:
+        cached = embedding_cache(VECTORS, model_key)
     wanted = {}
     for document in documents:
         wanted[source_id(document)] = document["text"]
@@ -113,8 +116,16 @@ def retrieve(question, method="hybrid", documents=None, config=None):
         documents = evidence_documents()
     report = {"method": method, "chunks_searched": len(documents), "index_ms": 0,
               "embedding_model": None, "dimensions": None}
-    started = time.monotonic()
-    if method in ("semantic", "hybrid"):
+    if method == "keyword" or method == "bm25":
+        started = time.monotonic()
+        if method == "keyword":
+            results = search_bilingual(documents, question)
+        else:
+            results = search_bm25(documents, question)
+    else:
+        # Both vector methods need every chunk embedded first. That time is
+        # reported separately as index_ms, so retrieval_ms stays comparable.
+        started = time.monotonic()
         index = build_index(documents, config)
         report["index_ms"] = round((time.monotonic() - started) * 1000, 2)
         report["embedding_model"] = index["model_key"]
@@ -122,18 +133,16 @@ def retrieve(question, method="hybrid", documents=None, config=None):
         report["embedded"] = index["embedded"]
         report["reused"] = index["reused"]
 
-        def search(chunks, text):
+        # hybrid_search wants a search function that takes (chunks, question).
+        # This small function remembers the index built above.
+        def vector_search(chunks, text):
             return semantic_results(chunks, text, config, index["index"], index["dimensions"])
 
-    started = time.monotonic()
-    if method == "keyword":
-        results = search_bilingual(documents, question)
-    elif method == "bm25":
-        results = search_bm25(documents, question)
-    elif method == "semantic":
-        results = search(documents, question)
-    else:
-        results = hybrid_search(documents, question, search)
+        started = time.monotonic()
+        if method == "semantic":
+            results = vector_search(documents, question)
+        else:
+            results = hybrid_search(documents, question, vector_search)
     report["retrieval_ms"] = round((time.monotonic() - started) * 1000, 2)
     report["results"] = results
     report["source_ids"] = [source_id(row) for row in results]

@@ -6,8 +6,7 @@ import sqlite3
 import time
 from contextlib import closing
 from datetime import datetime, timezone
-from retrieval import search_documents
-from retrieval import search_bilingual, search_bm25
+from retrieval import search_documents, search_bilingual, search_bm25
 from data_io import read_csv
 
 REVIEW_SOURCES = ("sop_v1.txt", "sop_v2_en.txt", "sop_v2_zh.txt", "metrics.csv", "deployments.csv")

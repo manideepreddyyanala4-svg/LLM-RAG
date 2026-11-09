@@ -1,6 +1,14 @@
-"""Optional PostgreSQL storage. Nothing connects until a caller supplies a DSN."""
+"""Optional PostgreSQL storage, plus the SQLite tables for vectors and AI runs.
+
+Nothing connects to PostgreSQL until a caller supplies a DSN.
+"""
+import json
 import re
+import sqlite3
+from contextlib import closing
+from datetime import date
 import psycopg
+from investigation import summarize_metrics
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS documents (
@@ -104,8 +112,6 @@ def setup_vectors(dsn, dimensions):
 
 def ingest_inspections(dsn, rows):
     """Validate then insert small operational records without duplicates."""
-    from datetime import date
-    from investigation import summarize_metrics
     require_dsn(dsn)
     summarize_metrics(rows)
     with psycopg.connect(dsn, connect_timeout=3) as connection:
@@ -142,12 +148,9 @@ def require_dsn(dsn):
         raise ValueError("An explicit PostgreSQL DSN is required")
 
 
-# The default lab setup uses SQLite; PostgreSQL above remains optional.
+# SQLite stores for the AI layer. The default lab setup uses SQLite; PostgreSQL above is optional.
 def embedding_cache(path, model_key):
     """Read vectors for exactly one model digest from the document database."""
-    import json
-    import sqlite3
-    from contextlib import closing
     path.parent.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(path, timeout=3)) as connection:
         with connection:
@@ -167,9 +170,6 @@ def embedding_cache(path, model_key):
 
 def save_embeddings(path, model_key, rows, replace=False):
     """Commit a complete batch atomically; reindex can remove obsolete vectors."""
-    import json
-    import sqlite3
-    from contextlib import closing
     with closing(sqlite3.connect(path, timeout=3)) as connection:
         with connection:
             if replace:
@@ -181,9 +181,6 @@ def save_embeddings(path, model_key, rows, replace=False):
 
 def save_ai_run(path, result):
     """Persist the actual answer, checks, tool trace, models and timings."""
-    import json
-    import sqlite3
-    from contextlib import closing
     path.parent.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(path, timeout=3)) as connection:
         with connection:
@@ -197,9 +194,6 @@ def save_ai_run(path, result):
 
 def list_ai_runs(path):
     """Read the latest twenty saved AI runs, including unsuccessful runs."""
-    import json
-    import sqlite3
-    from contextlib import closing
     if not path.exists():
         return []
     with closing(sqlite3.connect(path, timeout=3)) as connection:

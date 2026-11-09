@@ -81,6 +81,23 @@
       control.onclick = action;
       parent.append(control);
     }
+    // fetch() can send the access token header; a plain link or window.open cannot.
+    async function downloadOriginal(source, version) {
+      const query = new URLSearchParams({source: source, version: version});
+      try {
+        const response = await fetch(`/api/documents/file?${query}`, {
+          headers: {'X-Evidenceops-Token': byId('token').value}
+        });
+        if (!response.ok) throw Error(`Download failed: ${response.status}`);
+        const url = URL.createObjectURL(await response.blob());
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = source;
+        link.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        message('Download ready');
+      } catch (error) { message(error.message); }
+    }
     async function call(path, method='GET', data=null, approval=false, operator=false) {
       message('Working…');
       const headers = {'X-Evidenceops-Token': byId('token').value};
@@ -154,22 +171,7 @@
         }
         if (row.status === 'CURRENT' || row.status === 'OLD') {
           if (row.downloadable) {
-            button(box, 'Download original', async function () {
-              const query = new URLSearchParams({source: row.source, version: row.version});
-              try {
-                const response = await fetch(`/api/documents/file?${query}`, {
-                  headers: {'X-Evidenceops-Token': byId('token').value}
-                });
-                if (!response.ok) throw Error(`Download failed: ${response.status}`);
-                const url = URL.createObjectURL(await response.blob());
-                const link = document.createElement('a');
-                link.href = url;
-                link.download = row.source;
-                link.click();
-                setTimeout(() => URL.revokeObjectURL(url), 1000);
-                message('Download ready');
-              } catch (error) { message(error.message); }
-            });
+            button(box, 'Download original', function () { downloadOriginal(row.source, row.version); });
           }
           button(box, 'Soft-delete this version', async function () {
             if (!confirm(`Soft-delete ${row.source} ${row.version}?`)) return;
@@ -369,12 +371,13 @@
       if (data.unsupported_claims.length) item(output, 'Claims the checker rejected', `Claim numbers: ${data.unsupported_claims.join(', ')}`);
       for (const row of data.evidence) {
         const box = item(output, `${row.citation_id} · ${row.source} · ${row.location} · ${row.version || 'unknown version'}`, row.text);
-        if (row.source.endsWith('.txt') && row.version) {
-          button(box, 'Open original file', function () {
-            const query = new URLSearchParams({source: row.source, version: row.version});
-            window.open(`/api/documents/file?${query}`, '_blank');
-          });
+        // Only uploaded documents (status CURRENT) keep their original file.
+        if (row.status === 'CURRENT') {
+          button(box, 'Download original file', function () { downloadOriginal(row.source, row.version); });
         }
+      }
+      for (const row of data.excluded_evidence || []) {
+        item(output, `Excluded · ${row.source} · ${row.location}`, `${row.reason}\n\n${row.text}`);
       }
       item(output, 'Measured timings and models',
            `Retrieval: ${data.retrieval_ms} ms\nEmbedding index: ${data.index_ms} ms\nGeneration: ${data.inference_ms} ms\nCitation check: ${data.verification_ms} ms\nChunks searched: ${data.chunks_searched}\nEmbedding model: ${data.embedding_model || 'not used'}\nVector dimensions: ${data.dimensions || 'not used'}\nSaved run: ${data.run_id}`);
