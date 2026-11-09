@@ -195,7 +195,7 @@ class EvidenceTests(unittest.TestCase):
                 summarize_metrics([row])
 
     def test_ollama_no_network_without_approval(self):
-        # embed_texts goes through the same check_connection and post_ollama as every model call.
+        # embed_texts goes through the same check_connection and send_to_ollama as every model call.
         local = "http://localhost:11434"
         with patch("ollama_client.build_opener") as opener:
             self.assertEqual(embed_texts(["hello"], "http://example.invalid", "model")["code"], "not_approved")
