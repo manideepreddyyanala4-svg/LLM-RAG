@@ -59,17 +59,19 @@ def download_dataset(folder=STEEL_DIR):
         archive = response.read(5_000_001)
     if len(archive) > 5_000_000:
         raise ValueError("The downloaded archive is larger than expected")
-    saved = []
+    files = {}
     with zipfile.ZipFile(io.BytesIO(archive)) as package:
         for name, expected in FILE_HASHES.items():
             # Read only the two expected files; nothing else in the zip is extracted.
             content = package.read(name)
             if sha256_of(content) != expected:
                 raise ValueError(f"{name} does not match the published file; refusing to use it")
-            folder.mkdir(parents=True, exist_ok=True)
-            (folder / name).write_bytes(content)
-            saved.append(name)
-    return saved
+            files[name] = content
+    # Check both files before writing either one.
+    folder.mkdir(parents=True, exist_ok=True)
+    for name, content in files.items():
+        (folder / name).write_bytes(content)
+    return list(files)
 
 
 def read_checked_file(folder, name):
