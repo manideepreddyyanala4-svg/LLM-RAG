@@ -60,13 +60,18 @@ def download_dataset(folder=STEEL_DIR):
     if len(archive) > 5_000_000:
         raise ValueError("The downloaded archive is larger than expected")
     files = {}
-    with zipfile.ZipFile(io.BytesIO(archive)) as package:
-        for name, expected in FILE_HASHES.items():
-            # Read only the two expected files; nothing else in the zip is extracted.
-            content = package.read(name)
-            if sha256_of(content) != expected:
-                raise ValueError(f"{name} does not match the published file; refusing to use it")
-            files[name] = content
+    try:
+        with zipfile.ZipFile(io.BytesIO(archive)) as package:
+            for name, expected in FILE_HASHES.items():
+                # Reject a changed archive before decompressing a file.
+                if package.getinfo(name).file_size > 1_000_000:
+                    raise ValueError(f"{name} is larger than expected")
+                content = package.read(name)
+                if sha256_of(content) != expected:
+                    raise ValueError(f"{name} does not match the published file; refusing to use it")
+                files[name] = content
+    except (zipfile.BadZipFile, KeyError) as error:
+        raise ValueError("The UCI archive is missing or invalid") from error
     # Check both files before writing either one.
     folder.mkdir(parents=True, exist_ok=True)
     for name, content in files.items():

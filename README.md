@@ -2,7 +2,7 @@
 
 **Evidence-grounded RAG and a bounded MCP agent for manufacturing quality investigations — local, bilingual (English and Traditional Chinese), and human-approved.**
 
-[![Offline source checks](https://github.com/manideepreddyyanala4-svg/LLM-RAG/actions/workflows/offline.yml/badge.svg)](https://github.com/manideepreddyyanala4-svg/LLM-RAG/actions/workflows/offline.yml)
+[![Source and dataset checks](https://github.com/manideepreddyyanala4-svg/LLM-RAG/actions/workflows/offline.yml/badge.svg)](https://github.com/manideepreddyyanala4-svg/LLM-RAG/actions/workflows/offline.yml)
 
 EvidenceOps is a learning and portfolio project. It is **not production ready**. It has two separate demonstrations: a synthetic Line B investigation (Mode A) and deterministic analysis of the genuine [UCI Steel Plates Faults dataset](https://archive.ics.uci.edu/dataset/198/steel+plates+faults) (Mode B). These are unrelated sources.
 
@@ -28,6 +28,8 @@ Everything runs locally: FastAPI, SQLite, and Ollama on `127.0.0.1`. No data is 
 ## Demo
 
 [▶ Mode A demo video (72 s, MP4)](docs/evidenceops-demo.mp4) — recorded before the Mode B tab was added. It shows upload → embed → cited answers in English and Chinese → abstention → MCP agent → pending draft → approval denied with the wrong token → approval with the right one → audit trail. It does **not** show the UCI dataset.
+
+[▶ Mode B browser demo (11 s, MP4)](docs/steel-faults-demo.mp4) — recorded in Chrome against the real local API and Ollama. It shows the verified UCI download, Python-calculated category counts, and a cited answer. [Mode B screenshot](docs/steel-faults.png).
 
 | Cited answer (English, from a newly uploaded SOP) | Cited answer (Traditional Chinese) |
 |---|---|
@@ -193,11 +195,11 @@ The three tokens must all be different. The server refuses to approve anything i
 
 ### Automated tests
 
-`python -m unittest -q` runs **83 tests: 75 pass and 8 are skipped** after both demo data and the UCI files are downloaded. Without the UCI download, its data check is also skipped.
+`python -m unittest -q` runs **84 tests: 76 pass and 8 are skipped** after both demo data and the UCI files are downloaded. Without the UCI download, its data check is also skipped.
 
 The 8 skips are deliberate. Those tests assert exact values from the original EvidenceOps starter dataset, such as a 3.05% Line B v3 rejection rate. That dataset is not in this repository because it has no explicit redistribution license. The tests run again automatically whenever that dataset is present, and the demo data is not made to imitate it.
 
-GitHub Actions runs the dataset-free subset plus all AI-layer tests (no Ollama required), and a PostgreSQL/pgvector smoke test.
+GitHub Actions generates the synthetic demo, downloads and checks the real UCI files, runs the full offline suite (no Ollama required), and runs a separate PostgreSQL/pgvector smoke test. CI does not run real local-model inference.
 
 ### Real-model evaluation
 
@@ -217,10 +219,12 @@ Historical Mode A results from commit `2a56744`, run from a fresh clone, `qwen2.
 | Held-out (12) | 5 of 7 | 2 | 5 of 5 | 0 |
 | Prompt injection (4) | — | — | 4 of 4 resisted | 0 |
 
-Current `final-release` branch evaluation with the same installed models: regression **3 cited correct, 1 answerable refusal, 2 correct abstentions**; held-out **4 cited correct, 3 answerable refusals, 5 correct abstentions**; injection **4 of 4 resisted**; UCI steel **6 cited correct and 2 correct abstentions**. The held-out answers were reproduced in a second run. A same-machine run of the known-good commit returned **3 cited correct and 4 answerable refusals** on that set, so these small automatic case counts vary across runs and are not a reliable accuracy statistic. The agent made 15 distinct tool calls in three runs, with no refused or repeated calls. The full current run is saved locally by `main.py aieval` as `data/local/ai_evaluation.json` (ignored by Git).
+Recent `final-release` branch evaluations with the same installed models: regression **3 cited correct, 1 answerable refusal, 2 correct abstentions**; held-out **4–5 cited correct, 2–3 answerable refusals, 5 correct abstentions**; injection **4 of 4 resisted**; UCI steel **5–6 cited correct, 0–1 answerable refusals, 2 correct abstentions**. In the latest run, the Traditional Chinese largest-category answer was withheld by verification. Three agent runs made 14 steps, including one refused duplicate call; no unauthorized tool ran. A same-machine run of the known-good commit returned **3 cited correct and 4 answerable refusals** on the held-out set. These small automatic case counts vary across runs and are not a reliable accuracy statistic. The full latest run is saved locally by `main.py aieval` as `data/local/ai_evaluation.json` (ignored by Git).
 
-- **Retrieval:** the expected source was in the top three for 11 of 11 answerable cases with semantic and hybrid search, and 10 of 11 with keyword and BM25. Hybrid search takes about 30 ms and BM25 about 0.1 ms, plus a one-off embedding build. On a corpus this small, this shows only that cross-lingual matching works, not that one method ranks better.
-- **Latency:** a full answer takes a median of about 0.6 s, including about 0.36 s for generation and the claim check.
+The following measurements are from the historical `2a56744` run:
+
+- **Retrieval:** the expected source was in the top three for 11 of 11 answerable cases with semantic and hybrid search, and 10 of 11 with keyword and BM25. Hybrid search took about 30 ms and BM25 about 0.1 ms, plus a one-off embedding build. On a corpus this small, this shows only that cross-lingual matching works, not that one method ranks better.
+- **Latency:** a full answer took a median of about 0.6 s, including about 0.36 s for generation and the claim check.
 - **Repeatability:** each of the 4 repeated cases gave the same result in all 3 runs.
 - **Agent:** 3 runs, 15 tool calls, none refused or repeated. The model finished every run itself, always after an SOP search.
 
@@ -247,7 +251,7 @@ Hardware: NVIDIA GeForce RTX 5080 (16 GB), 123 GB RAM.
 - **The agent wastes some steps.** It reads Line A, which has no records in the demo data. Its summaries usually abstain, because the SOPs do not state causes, which is the correct outcome.
 - **Docker runs the offline features only.** Inside a container, `127.0.0.1` is not the host, so local AI is disabled by design.
 - **Not tested here:** scanned-PDF OCR (only with mocks), multiple users, and large corpora.
-- **Mode B recording is pending.** The linked MP4 shows only Mode A. The Mode B API and HTML controls were checked, but browser interaction and a fresh Mode B screenshot or video have not been verified in this release branch.
+- **Docker execution on the university lab computer is unverified.** This release was tested with native Python, SQLite, FastAPI and Ollama. The Dockerfile and Compose configuration are preserved but were not run on that computer.
 
 ## More features
 

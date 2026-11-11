@@ -74,6 +74,17 @@ def make_test_pdf():
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_steel_download_rejects_invalid_archive_without_writing(self):
+        """A changed UCI archive must not leave a partial raw dataset."""
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / "steel"
+            opener = MagicMock()
+            opener.open.return_value = io.BytesIO(b"not a zip archive")
+            with patch.object(steel_faults, "build_opener", return_value=opener):
+                with self.assertRaisesRegex(ValueError, "missing or invalid"):
+                    steel_faults.download_dataset(target)
+            self.assertFalse(target.exists())
+
     def test_steel_counts_and_source_provenance(self):
         """Check the official raw files independently when downloaded locally."""
         if not (steel_faults.STEEL_DIR / "Faults.NNA").is_file():

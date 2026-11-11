@@ -1,4 +1,4 @@
-name: Offline source checks
+name: Source and dataset checks
 
 on: [push, pull_request]
 
@@ -17,41 +17,10 @@ jobs:
           python-version: '3.14'
       - run: python -m pip install -r requirements.txt
       - run: python -m compileall -q .
-      - name: Test without private datasets
-        run: |
-          python -m unittest -q \
-            test_evidenceops.EvidenceTests.test_bad_files \
-            test_evidenceops.EvidenceTests.test_invalid_counts_and_zero \
-            test_evidenceops.EvidenceTests.test_evaluation_gate_and_counts \
-            test_evidenceops.EvidenceTests.test_terminal_json_export_requires_saved_manual_review \
-            test_evidenceops.EvidenceTests.test_ollama_no_network_without_approval \
-            test_evidenceops.EvidenceTests.test_ollama_response_validation \
-            test_evidenceops.EvidenceTests.test_ollama_model_discovery_is_bounded_and_requires_approval \
-            test_evidenceops.EvidenceTests.test_embedding_adapter_requires_approval_and_valid_vectors \
-            test_evidenceops.EvidenceTests.test_vector_ranking_uses_supplied_vectors_only \
-            test_evidenceops.EvidenceTests.test_ticket_restart_rejection_completion_and_audit \
-            test_evidenceops.EvidenceTests.test_ticket_migration_and_competing_decisions \
-            test_evidenceops.EvidenceTests.test_legacy_document_conflicts_abort_import \
-            test_evidenceops.EvidenceTests.test_legacy_document_import_records_history_once \
-            test_evidenceops.EvidenceTests.test_existing_document_database_gains_original_file_column \
-            test_evidenceops.EvidenceTests.test_pdf_pages_original_bytes_and_deletion \
-            test_evidenceops.EvidenceTests.test_scanned_pdf_ocr_is_optional_and_never_silent \
-            test_evidenceops.EvidenceTests.test_restore_deleted_version_supersedes_current_after_restart \
-            test_evidenceops.EvidenceTests.test_restore_rejects_corrupt_file_without_changing_current_version \
-            test_evidenceops.EvidenceTests.test_text_byte_limit_and_exact_uploaded_bytes \
-            test_evidenceops.EvidenceTests.test_old_label_store_needs_new_source_review \
-            test_evidenceops.EvidenceTests.test_private_sqlite_backup_is_consistent_and_never_overwrites \
-            test_evidenceops.EvidenceTests.test_mcp_client_reports_discovery_timeout \
-            test_evidenceops.EvidenceTests.test_postgres_inspection_conflict_is_not_silently_ignored \
-            test_evidenceops.EvidenceTests.test_postgres_version_and_vector_validation_without_server \
-          test_evidenceops.EvidenceTests.test_api_error_does_not_expose_absolute_evidence_path \
-          test_evidenceops.EvidenceTests.test_starter_hash_uses_exact_file_bytes \
-          test_evidenceops.EvidenceTests.test_failed_backup_leaves_no_partial_snapshot \
-          test_evidenceops.EvidenceTests.test_review_store_cannot_reference_files_outside_evidence_folder \
-            test_evidenceops.EvidenceTests.test_synthetic_review_and_json_evaluation \
-            test_evidenceops.EvidenceTests.test_demo_data_is_explicitly_synthetic_and_never_overwrites
-      - name: Test the AI layer without Ollama or private datasets
-        run: python -m unittest -q test_evidenceops.RagTests
+      - run: python main.py demo
+      - run: python main.py steel-download
+      - name: Run the full offline suite with real UCI records
+        run: python -m unittest -q
 
   postgres:
     runs-on: ubuntu-latest
