@@ -11,13 +11,14 @@ from pydantic import BaseModel, Field
 from typing import Literal
 import sqlite3
 from data_io import DATA, LOCAL, ROOT, document_inventory, document_history, ingest_document, ingest_pdf, read_document_file, delete_document, restore_document, load_documents, read_csv
-from retrieval import search_bilingual, search_bm25, current_evidence
+from retrieval import search_bilingual, search_bm25, current_evidence, not_deleted
 from evaluation import evaluate_questions, compare_searches, review_label, read_verified_questions, REVIEW_SOURCES
 from investigation import investigation_report, prepare_ticket, list_tickets, approve_ticket, change_ticket, ticket_history
 from workflow import run_workflow, record_workflow_run, list_workflow_runs
 from rag import answer_question, compare_methods, run_agent, ai_status, build_index, evidence_documents, RUNS
 from ollama_client import ai_settings
 from database import list_ai_runs
+from steel_faults import download_dataset, load_dataset, summarize, steel_documents, STEEL_DIR
 
 app = FastAPI(title="EvidenceOps", docs_url=None, redoc_url=None, openapi_url=None)
 STORE = LOCAL / "documents.db"
@@ -40,7 +41,10 @@ async def request_limits(request: Request, call_next):
             return JSONResponse({"detail": "Content-Length is required"}, status_code=411)
         if size is None:
             size = "0"
-        limit = 2_000_000 if path == "/api/documents/upload" else 200_000
+        if path == "/api/documents/upload":
+            limit = 2_000_000
+        else:
+            limit = 200_000
         if not size.isdigit() or int(size) > limit:
             return JSONResponse({"detail": "Request body too large or invalid"}, status_code=413)
         if request.method in ("POST", "PUT", "PATCH", "DELETE"):
@@ -51,10 +55,15 @@ async def request_limits(request: Request, call_next):
                 body.extend(chunk)
             # Starlette reuses this cached body when FastAPI parses the request.
             request._body = bytes(body)
-        address = request.client.host if request.client else "unknown"
+        address = "unknown"
+        if request.client:
+            address = request.client.host
+        # Keep only this client's request times from the last 60 seconds.
         with RATE_LOCK:
-            recent = REQUEST_TIMES.get(address, [])
-            recent = [when for when in recent if started - when < 60]
+            recent = []
+            for when in REQUEST_TIMES.get(address, []):
+                if started - when < 60:
+                    recent.append(when)
             if len(recent) >= RATE_LIMIT:
                 REQUEST_TIMES[address] = recent
                 return JSONResponse({"detail": "Too many requests"}, status_code=429)
@@ -99,6 +108,8 @@ class WorkflowInput(BaseModel):
 class AskInput(BaseModel):
     question: str = Field(min_length=1, max_length=1000)
     method: Literal["keyword", "bm25", "semantic", "hybrid"] = "hybrid"
+    # "synthetic" = Mode A demo SOPs and records; "steel" = Mode B real UCI dataset.
+    dataset: Literal["synthetic", "steel"] = "synthetic"
 
 
 class AgentInput(BaseModel):
@@ -190,17 +201,24 @@ def overview(x_evidenceops_token: str | None = Header(default=None)):
 @app.post("/api/search")
 def search(payload: Question, x_evidenceops_token: str | None = Header(default=None)):
     authorize(x_evidenceops_token)
-    method = search_bm25 if payload.method == "bm25" else search_bilingual
     evidence = safe_documents(payload.include_csv, include_deleted=not payload.active_only)
     if payload.active_only:
         evidence = current_evidence(evidence)
     else:
-        evidence = [row for row in evidence if row.get("status") != "DELETED"]
-    if payload.source:
-        evidence = [row for row in evidence if row["source"] == payload.source]
-    if payload.version:
-        evidence = [row for row in evidence if row.get("version") == payload.version]
-    return {"method": payload.method, "results": method(evidence, payload.question)}
+        evidence = not_deleted(evidence)
+    # Optional filters: one exact source file and/or one exact version.
+    chosen = []
+    for row in evidence:
+        if payload.source and row["source"] != payload.source:
+            continue
+        if payload.version and row.get("version") != payload.version:
+            continue
+        chosen.append(row)
+    if payload.method == "bm25":
+        results = search_bm25(chosen, payload.question)
+    else:
+        results = search_bilingual(chosen, payload.question)
+    return {"method": payload.method, "results": results}
 
 
 @app.get("/api/documents")
@@ -257,7 +275,10 @@ def download_document(source: str, version: str,
         raise HTTPException(404, str(error)) from error
     except (OSError, sqlite3.DatabaseError) as error:
         raise HTTPException(503, "Document store unavailable") from error
-    kind = "application/pdf" if source.endswith(".pdf") else "text/plain; charset=utf-8"
+    if source.endswith(".pdf"):
+        kind = "application/pdf"
+    else:
+        kind = "text/plain; charset=utf-8"
     return Response(content, media_type=kind, headers={
         "Content-Disposition": f'attachment; filename="{source}"',
         "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"})
@@ -332,9 +353,10 @@ def evaluation(x_evidenceops_token: str | None = Header(default=None)):
     try:
         questions = read_csv(DATA / "questions.csv", ["question_id", "question", "expected_source"])
         reviewed = read_verified_questions(REVIEWS, DATA / "questions.csv")
-        reviewed_ids = [row["question_id"] for row in reviewed]
+        reviewed_ids = []
         reviewed_sources = {}
         for row in reviewed:
+            reviewed_ids.append(row["question_id"])
             reviewed_sources[row["question_id"]] = row["expected_source"]
         source_options = list(REVIEW_SOURCES)
         evidence = []
@@ -342,7 +364,11 @@ def evaluation(x_evidenceops_token: str | None = Header(default=None)):
             if document["source"] in source_options:
                 evidence.append({"source": document["source"], "location": document["location"],
                                  "text": document["text"], "status": document.get("status")})
-        return {"status": "partial review" if reviewed else "unverified", "questions": questions,
+        if reviewed:
+            status = "partial review"
+        else:
+            status = "unverified"
+        return {"status": status, "questions": questions,
                 "reviewed_ids": reviewed_ids, "reviewed_sources": reviewed_sources,
                 "source_options": source_options, "evidence": evidence,
                 "message": "Supplied answers and sources are proposals until you inspect evidence and confirm each question."}
@@ -485,12 +511,19 @@ def ai_index(rebuild: bool = False, x_evidenceops_token: str | None = Header(def
             "chunks": index["chunks"], "embedded": index["embedded"], "reused": index["reused"]}
 
 
+def chosen_documents(dataset):
+    """The evidence for one mode. The two modes are never searched together."""
+    if dataset == "steel":
+        return steel_documents()
+    return evidence_documents()
+
+
 @app.post("/api/ask")
 def ask(payload: AskInput, x_evidenceops_token: str | None = Header(default=None)):
     """Retrieve real evidence, generate a grounded answer, and verify its citations."""
     authorize(x_evidenceops_token)
     try:
-        return answer_question(payload.question, payload.method)
+        return answer_question(payload.question, payload.method, chosen_documents(payload.dataset))
     except (RuntimeError, ValueError, OSError, sqlite3.DatabaseError) as error:
         raise ai_error(error) from error
 
@@ -500,9 +533,33 @@ def retrieval_compare(payload: AskInput, x_evidenceops_token: str | None = Heade
     """Rank the same chunks with all four methods for one question."""
     authorize(x_evidenceops_token)
     try:
-        return compare_methods(payload.question)
+        return compare_methods(payload.question, chosen_documents(payload.dataset))
     except (RuntimeError, ValueError, OSError, sqlite3.DatabaseError) as error:
         raise ai_error(error) from error
+
+
+@app.get("/api/steel")
+def steel_facts(x_evidenceops_token: str | None = Header(default=None)):
+    """Mode B facts, calculated in Python from the real UCI files. No model is used."""
+    authorize(x_evidenceops_token)
+    try:
+        return summarize(load_dataset(STEEL_DIR))
+    except FileNotFoundError as error:
+        raise HTTPException(404, str(error)) from error
+    except (OSError, ValueError) as error:
+        raise HTTPException(503, f"Steel dataset unavailable: {error}") from error
+
+
+@app.post("/api/steel/download")
+def steel_download(x_evidenceops_token: str | None = Header(default=None),
+                   x_operator_token: str | None = Header(default=None)):
+    """Download the official UCI files. The address and file hashes are fixed in steel_faults.py."""
+    authorize(x_evidenceops_token)
+    authorize_operator(x_operator_token)
+    try:
+        return {"saved": download_dataset(STEEL_DIR)}
+    except (OSError, ValueError) as error:
+        raise HTTPException(503, f"Download failed: {error}") from error
 
 
 @app.post("/api/agent")

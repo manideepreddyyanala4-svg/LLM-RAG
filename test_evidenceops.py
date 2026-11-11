@@ -32,6 +32,7 @@ from mcp_client import main as mcp_client_main
 from workflow import run_workflow, compare_deployments, record_workflow_run, list_workflow_runs
 from database import setup_database, setup_vectors, ingest_version, ingest_inspections, delete_inactive_version
 import main as terminal
+import steel_faults
 
 
 def starter_dataset_present():
@@ -73,6 +74,42 @@ def make_test_pdf():
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_steel_download_rejects_invalid_archive_without_writing(self):
+        """A changed UCI archive must not leave a partial raw dataset."""
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / "steel"
+            opener = MagicMock()
+            opener.open.return_value = io.BytesIO(b"not a zip archive")
+            with patch.object(steel_faults, "build_opener", return_value=opener):
+                with self.assertRaisesRegex(ValueError, "missing or invalid"):
+                    steel_faults.download_dataset(target)
+            self.assertFalse(target.exists())
+
+    def test_steel_counts_and_source_provenance(self):
+        """Check the official raw files independently when downloaded locally."""
+        if not (steel_faults.STEEL_DIR / "Faults.NNA").is_file():
+            self.skipTest("Run python main.py steel-download for the real-data check")
+        raw = (steel_faults.STEEL_DIR / "Faults.NNA").read_bytes()
+        names = (steel_faults.STEEL_DIR / "Faults27x7_var").read_text("ascii").splitlines()
+        import hashlib
+        self.assertEqual(hashlib.sha256(raw).hexdigest(), steel_faults.FILE_HASHES["Faults.NNA"])
+        self.assertEqual(len(names), 34)
+        self.assertEqual(len(raw.splitlines()), 1941)
+        counts = {name: 0 for name in names[27:]}
+        for line in raw.splitlines():
+            fields = line.decode("ascii").split("\t")
+            self.assertEqual(len(fields), 34)
+            labels = [float(value) for value in fields[27:]]
+            self.assertEqual(sum(labels), 1)
+            counts[names[27 + labels.index(1)]] += 1
+        self.assertEqual(counts, {"Pastry": 158, "Z_Scratch": 190, "K_Scatch": 391,
+                                  "Stains": 72, "Dirtiness": 55, "Bumps": 402,
+                                  "Other_Faults": 673})
+        summary = steel_faults.summarize(steel_faults.load_dataset())
+        self.assertEqual({item["name"]: item["records"] for item in summary["categories"]}, counts)
+        self.assertEqual(summary["largest"]["name"], "Other_Faults")
+        self.assertEqual(summary["missing_values"], 0)
+
     def test_demo_data_is_explicitly_synthetic_and_never_overwrites(self):
         with tempfile.TemporaryDirectory() as folder:
             data = Path(folder) / "demo"
@@ -195,7 +232,7 @@ class EvidenceTests(unittest.TestCase):
                 summarize_metrics([row])
 
     def test_ollama_no_network_without_approval(self):
-        # embed_texts goes through the same check_connection and post_ollama as every model call.
+        # embed_texts goes through the same check_connection and send_to_ollama as every model call.
         local = "http://localhost:11434"
         with patch("ollama_client.build_opener") as opener:
             self.assertEqual(embed_texts(["hello"], "http://example.invalid", "model")["code"], "not_approved")

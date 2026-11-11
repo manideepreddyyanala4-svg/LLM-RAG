@@ -29,16 +29,17 @@
   </style>
 </head>
 <body>
-  <header><div class="eyebrow">Agent Reliability Lab</div><h1>EvidenceOps</h1><p>Local investigation desk · synthetic records · source-linked findings</p></header>
+  <header><div class="eyebrow">Agent Reliability Lab</div><h1>EvidenceOps</h1><p>Mode A: synthetic investigation · Mode B: real UCI steel fault records</p></header>
   <main>
     <nav aria-label="Sections">
-      <button class="active" data-tab="overview">Overview</button><button data-tab="search">Search</button><button data-tab="documents">Documents</button><button data-tab="investigation">Investigation</button><button data-tab="evaluation">Evaluation</button><button data-tab="tickets">Incidents</button><button data-tab="workflow">Workflow</button><button data-tab="ai">AI answers</button>
+      <button class="active" data-tab="overview">Overview</button><button data-tab="steel">Real steel data</button><button data-tab="search">Search</button><button data-tab="documents">Documents</button><button data-tab="investigation">Investigation</button><button data-tab="evaluation">Evaluation</button><button data-tab="tickets">Incidents</button><button data-tab="workflow">Workflow</button><button data-tab="ai">AI answers</button>
     </nav>
     <div>
       <div class="panel"><label for="token">Local access token</label><input id="token" type="password" autocomplete="off" placeholder="EVIDENCEOPS_TOKEN from your CMD session"><label for="operator-token">Operator token</label><input id="operator-token" type="password" autocomplete="off" placeholder="EVIDENCEOPS_OPERATOR_TOKEN"><label for="approval-token">Human approval token</label><input id="approval-token" type="password" autocomplete="off" placeholder="EVIDENCEOPS_APPROVAL_TOKEN"><small>Used only in requests to this local server. This page does not store these tokens.</small><div id="message" role="status" aria-live="polite"></div></div>
       <section id="overview" class="active"><div class="panel"><h2>Local system overview</h2><p class="muted">Enter the access token above, then load the current evidence, review, and ticket counts. Local model status is shown below.</p><button class="primary" id="overview-go">Refresh status</button><div id="overview-output"></div></div></section>
+      <section id="steel"><div class="panel"><h2>Mode B · real industrial data</h2><p>UCI Steel Plates Faults contains fault observations from a public research dataset. It is unrelated to the synthetic Line B investigation.</p><p class="muted">Download the original files once, then calculate exact counts in Python. No model estimates these numbers.</p><button class="secondary" id="steel-download-go">Download verified UCI files</button><button class="primary" id="steel-go">Calculate fault counts</button><div id="steel-output"></div><p><a href="https://archive.ics.uci.edu/dataset/198/steel+plates+faults" target="_blank" rel="noopener noreferrer">Official UCI dataset page</a> · <a href="https://doi.org/10.24432/C5J88N" target="_blank" rel="noopener noreferrer">Dataset DOI</a></p></div></section>
       <section id="search"><div class="panel"><h2>Search evidence</h2><p class="muted">English words and Traditional Chinese character pairs. Scores are lexical.</p><label for="question">Question</label><input id="question" placeholder="What changed in model v4?"><label for="method">Ranking method</label><select id="method"><option value="keyword">Keyword overlap</option><option value="bm25">BM25</option></select><label for="search-source">Source filename (optional)</label><input id="search-source" placeholder="sop_v2_en.txt"><label for="search-version">Version (optional)</label><input id="search-version" placeholder="SOP-V2-EN"><label><input id="active-only" type="checkbox" checked> Current or active evidence only (uncheck for history)</label><label><input id="csv" type="checkbox" checked> Include small inspection and deployment CSV records</label><button class="primary" id="search-go">Search</button><div id="search-output"></div></div></section>
-      <section id="documents"><div class="panel"><h2>Documents</h2><button class="secondary" id="documents-go">Refresh inventory</button><button class="secondary" id="dataset-go">Parquet metadata</button><div id="documents-output"></div></div><div class="panel"><h3>Add a local document version</h3><p class="muted">Existing versions remain available. Text is limited to 100 KB; PDFs are limited to 2 MB and need extractable text or installed OCR tools.</p><label for="source">Filename for pasted text</label><input id="source" placeholder="procedure.txt"><label for="version">Version</label><input id="version" placeholder="v1"><label for="doc-text">Paste text</label><textarea id="doc-text"></textarea><button class="primary" id="ingest-go">Add pasted text</button><label for="upload-file">Or choose a .txt or .pdf file</label><input id="upload-file" type="file" accept=".txt,.pdf"><button class="secondary" id="upload-go">Upload selected file</button></div></section>
+      <section id="documents"><div class="panel"><h2>Documents</h2><button class="secondary" id="documents-go">Refresh inventory</button><button class="secondary" id="dataset-go">Optional Parquet metadata</button><div id="documents-output"></div></div><div class="panel"><h3>Add a local document version</h3><p class="muted">Existing versions remain available. Text is limited to 100 KB; PDFs are limited to 2 MB and need extractable text or installed OCR tools.</p><label for="source">Filename for pasted text</label><input id="source" placeholder="procedure.txt"><label for="version">Version</label><input id="version" placeholder="v1"><label for="doc-text">Paste text</label><textarea id="doc-text"></textarea><button class="primary" id="ingest-go">Add pasted text</button><label for="upload-file">Or choose a .txt or .pdf file</label><input id="upload-file" type="file" accept=".txt,.pdf"><button class="secondary" id="upload-go">Upload selected file</button></div></section>
       <section id="investigation"><div class="panel"><h2>Operational investigation</h2><p class="muted">Calculated from local synthetic inspection and deployment records.</p><button class="primary" id="investigation-go">Calculate rejection report</button><button class="secondary" id="deployment-go">Compare Line B deployments</button><div id="investigation-output"></div></div></section>
       <section id="evaluation"><div class="panel"><h2>Retrieval evaluation</h2><p class="muted">The supplied answers and sources are unverified proposals. Open the cited records, type the sources you confirmed, then save each review with the approval token.</p><button class="secondary" id="labels-go">Review labels</button><button class="secondary" id="compare-go">Compare lexical methods</button><div id="labels-output"></div><button class="primary" id="evaluate-go">Evaluate saved reviews</button><div id="evaluation-output"></div></div></section>
       <section id="tickets"><div class="panel"><h2>Incident drafts</h2><p class="muted">Preparation creates a pending draft. Decisions require the separate human approval token above.</p><label for="ticket-question">Investigation question</label><input id="ticket-question" placeholder="Review the Line B rejection increase"><button class="primary" id="ticket-go">Prepare draft</button><button class="secondary" id="tickets-go">Refresh incidents</button><div id="tickets-output"></div></div></section>
@@ -47,6 +48,7 @@
         <button class="secondary" id="ai-status-go">Check models and index</button><button class="secondary" id="ai-index-go">Build missing embeddings</button><div id="ai-status-output"></div>
         <label for="ai-question">Question</label><input id="ai-question" placeholder="目前 B 線的閾值是多少？">
         <label for="ai-method">Retrieval method</label><select id="ai-method"><option value="hybrid">Hybrid (keyword + vector)</option><option value="semantic">Semantic vectors</option><option value="bm25">BM25</option><option value="keyword">Keyword overlap</option></select>
+        <label for="ai-dataset">Evidence mode</label><select id="ai-dataset"><option value="synthetic">Mode A · synthetic Line B documents</option><option value="steel">Mode B · real UCI computed summaries</option></select>
         <button class="primary" id="ai-ask-go">Generate grounded answer</button><button class="secondary" id="ai-compare-go">Compare all four methods</button><div id="ai-output"></div></div>
         <div class="panel"><h3>Bounded investigation agent</h3><p class="muted">The agent may call only four approved MCP tools, within a fixed step limit. It can prepare a pending incident draft with the operator token, but it can never approve one. Approve or reject in the Incidents tab with the human approval token.</p>
         <label for="agent-request">Investigation request</label><input id="agent-request" placeholder="Investigate the Line B rejection increase">
@@ -139,6 +141,21 @@
            `Evidence chunks: ${data.evidence_chunks}\nQuestions: ${data.questions}\nReviewed questions: ${data.reviewed_questions}\nTickets: ${data.tickets}\nPending tickets: ${data.pending_tickets}`);
       item(output, 'Local AI', data.ai_configured ? 'Configured on this server; open the AI answers tab' : 'Not configured; set EVIDENCEOPS_AI_ENABLED=1');
     };
+    byId('steel-download-go').onclick = async function () {
+      const data = await call('/api/steel/download', 'POST', null, false, true);
+      if (data) { message(`Verified UCI files: ${data.saved.join(', ')}`); byId('steel-go').click(); }
+    };
+    byId('steel-go').onclick = async function () {
+      const output = clear('steel-output');
+      const data = await call('/api/steel');
+      if (!data) return;
+      item(output, 'Verified original records', `${data.records} fault records · ${data.feature_names.length} measured features · ${data.columns} total columns · ${data.missing_values} missing values`);
+      for (const row of data.categories) item(output, row.name, `${row.records} records · ${row.percent}% of fault records`);
+      item(output, 'Largest category', `${data.largest.name}: ${data.largest.records} records`);
+      item(output, 'Measured features', data.feature_names.join(', '));
+      item(output, 'What these records cannot show', 'The dataset contains no fault-free plates. It cannot establish a factory-wide fault rate, production trend, defect cause, or model deployment outcome.');
+      item(output, 'Source and license', `${data.citation}\n${data.license}\nRaw data SHA-256: ${data.sha256}`);
+    };
     byId('search-go').onclick = async function () {
       const output = clear('search-output');
       const query = {question: byId('question').value, include_csv: byId('csv').checked,
@@ -193,6 +210,7 @@
       const output = clear('documents-output');
       const data = await call('/api/dataset');
       if (!data) return;
+      if (!data.files.length) item(output, 'No optional Parquet files', 'The synthetic and UCI demos do not need Parquet.');
       for (const row of data.files) item(output, `${row.source} · ${row.rows.toLocaleString()} rows`, row.columns.join(', '));
     };
     byId('ingest-go').onclick = async function () {
@@ -401,12 +419,12 @@
     };
     byId('ai-ask-go').onclick = async function () {
       const output = clear('ai-output');
-      const data = await call('/api/ask', 'POST', {question: byId('ai-question').value, method: byId('ai-method').value});
+      const data = await call('/api/ask', 'POST', {question: byId('ai-question').value, method: byId('ai-method').value, dataset: byId('ai-dataset').value});
       if (data) showAnswer(output, data);
     };
     byId('ai-compare-go').onclick = async function () {
       const output = clear('ai-output');
-      const data = await call('/api/retrieval/compare', 'POST', {question: byId('ai-question').value});
+      const data = await call('/api/retrieval/compare', 'POST', {question: byId('ai-question').value, dataset: byId('ai-dataset').value});
       if (!data) return;
       for (const row of data.comparison) {
         const lines = row.ranking.map(hit => `#${hit.rank} ${hit.source} ${hit.location} · score ${hit.fusion_score ?? hit.score}`);

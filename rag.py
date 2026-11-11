@@ -62,7 +62,9 @@ def build_index(documents, config, rebuild=False):
     added = {}
     for start in range(0, len(missing), BATCH):
         batch = missing[start:start + BATCH]
-        texts = [wanted[key] for key in batch]
+        texts = []
+        for key in batch:
+            texts.append(wanted[key])
         result = embed_texts(texts, config["endpoint"], config["embedding_model"], True, config["timeout"])
         if "error" in result:
             raise RuntimeError("Embedding failed: " + result["error"])
@@ -145,7 +147,9 @@ def retrieve(question, method="hybrid", documents=None, config=None):
             results = hybrid_search(documents, question, vector_search)
     report["retrieval_ms"] = round((time.monotonic() - started) * 1000, 2)
     report["results"] = results
-    report["source_ids"] = [source_id(row) for row in results]
+    report["source_ids"] = []
+    for row in results:
+        report["source_ids"].append(source_id(row))
     return report
 
 
@@ -213,8 +217,10 @@ def available_actions(used, allow_draft):
     searched = "search_approved_documents" in used
     actions = []
     for action, limit in ACTION_LIMITS.items():
-        if action == "prepare_incident_ticket" and not (allow_draft and searched):
-            continue
+        if action == "prepare_incident_ticket":
+            # A draft needs the operator role and at least one SOP search first.
+            if not allow_draft or not searched:
+                continue
         if used.count(action) < limit:
             actions.append(action)
     # Findings must cite SOP evidence, so a draft and finish are offered only after
@@ -232,9 +238,11 @@ def tool_arguments(action, question, allow_draft, used):
         raise ValueError("Preparing an incident draft needs the operator token")
     if used.count(action) >= ACTION_LIMITS[action]:
         raise ValueError(f"{action} has already used its budget for this run")
-    name, _, line = action.partition(":")
-    if line:
+    # "read_inspection_metrics:B" means tool read_inspection_metrics with line B.
+    if ":" in action:
+        name, line = action.split(":")
         return name, {"line": line}
+    name = action
     if not isinstance(question, str) or not question.strip() or len(question) > 1000:
         raise ValueError(f"{name} needs a question of 1 to 1000 characters")
     return name, {"question": question.strip()}
@@ -305,7 +313,10 @@ async def call_tools(request, allow_draft, config):
     stopped = "step limit reached"
     async with Client(server_settings(allow_draft)) as client:
         listing = await asyncio.wait_for(client.list_tools(), timeout=15)
-        offered = sorted(tool.name for tool in listing.tools)
+        offered = []
+        for tool in listing.tools:
+            offered.append(tool.name)
+        offered.sort()
         while len(steps) < MAX_STEPS:
             actions = available_actions(used, allow_draft)
             if actions == ["finish"]:
@@ -353,6 +364,23 @@ async def call_tools(request, allow_draft, config):
             "tools_offered": offered, "tools_approved": approved}
 
 
+def chunks_from_search(output):
+    """Turn one search tool result back into evidence chunks.
+
+    MCP wraps a list result as {"result": [...]}, so unwrap it first.
+    """
+    if isinstance(output, dict):
+        output = output.get("result", [])
+    if not isinstance(output, list):
+        return []
+    chunks = []
+    for row in output:
+        if isinstance(row, dict) and "text" in row:
+            chunks.append({"source": row["source"], "location": row["location"], "text": row["text"],
+                           "version": row.get("version"), "status": row.get("status")})
+    return chunks
+
+
 def run_agent(request, allow_draft=False):
     """Bounded investigation agent: approved tools only, and no self-approval."""
     if not isinstance(request, str) or not request.strip() or len(request) > 1000:
@@ -363,14 +391,7 @@ def run_agent(request, allow_draft=False):
     ticket = None
     for step in trace["steps"]:
         if step["tool"] == "search_approved_documents" and step["ok"]:
-            rows = step["output"]
-            if isinstance(rows, dict):
-                rows = rows.get("result", [])
-            for row in rows or []:
-                if isinstance(row, dict) and "text" in row:
-                    evidence.append({"source": row["source"], "location": row["location"],
-                                     "text": row["text"], "version": row.get("version"),
-                                     "status": row.get("status")})
+            evidence.extend(chunks_from_search(step["output"]))
         if step["tool"] == "prepare_incident_ticket" and step["ok"]:
             ticket = step["output"]
     summary = grounded_answer(request, evidence, config)
@@ -407,5 +428,8 @@ def ai_status():
     status["chunks"] = len(documents)
     status["vectors_cached"] = len(cached)
     status["chunks_without_vectors"] = missing
-    status["dimensions"] = len(next(iter(cached.values()))) if cached else None
+    status["dimensions"] = None
+    for vector in cached.values():
+        status["dimensions"] = len(vector)  # every cached vector has the same size
+        break
     return status

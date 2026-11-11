@@ -2,9 +2,9 @@
 
 **Evidence-grounded RAG and a bounded MCP agent for manufacturing quality investigations — local, bilingual (English and Traditional Chinese), and human-approved.**
 
-[![Offline source checks](https://github.com/manideepreddyyanala4-svg/LLM-RAG/actions/workflows/offline.yml/badge.svg)](https://github.com/manideepreddyyanala4-svg/LLM-RAG/actions/workflows/offline.yml)
+[![Source and dataset checks](https://github.com/manideepreddyyanala4-svg/LLM-RAG/actions/workflows/offline.yml/badge.svg)](https://github.com/manideepreddyyanala4-svg/LLM-RAG/actions/workflows/offline.yml)
 
-EvidenceOps is a learning and portfolio project. It is **not production ready**, and it runs on **synthetic** data only.
+EvidenceOps is a learning and portfolio project. It is **not production ready**. It has two separate demonstrations: a synthetic Line B investigation (Mode A) and deterministic analysis of the genuine [UCI Steel Plates Faults dataset](https://archive.ics.uci.edu/dataset/198/steel+plates+faults) (Mode B). These are unrelated sources.
 
 ## The problem
 
@@ -27,7 +27,9 @@ Everything runs locally: FastAPI, SQLite, and Ollama on `127.0.0.1`. No data is 
 
 ## Demo
 
-[▶ Demo video (72 s, MP4)](docs/evidenceops-demo.mp4) — the real dashboard driven in headless Chrome against real Ollama models. It shows upload → embed → cited answers in English and Chinese → abstention → MCP agent → pending draft → approval denied with the wrong token → approval with the right one → audit trail.
+[▶ Mode A demo video (72 s, MP4)](docs/evidenceops-demo.mp4) — recorded before the Mode B tab was added. It shows upload → embed → cited answers in English and Chinese → abstention → MCP agent → pending draft → approval denied with the wrong token → approval with the right one → audit trail. It does **not** show the UCI dataset.
+
+[▶ Mode B browser demo (11 s, MP4)](docs/steel-faults-demo.mp4) — recorded in Chrome against the real local API and Ollama. It shows the verified UCI download, Python-calculated category counts, and a cited answer. [Mode B screenshot](docs/steel-faults.png).
 
 | Cited answer (English, from a newly uploaded SOP) | Cited answer (Traditional Chinese) |
 |---|---|
@@ -52,6 +54,7 @@ Everything runs locally: FastAPI, SQLite, and Ollama on `127.0.0.1`. No data is 
 | Deterministic rejection-rate investigation and deployment comparison | Works, tested |
 | SQLite persistence across restarts; backup and restore | Works, tested |
 | Optional PostgreSQL/pgvector adapter | Tested in CI with synthetic records; not used by the API |
+| Real UCI fault data: verified download, exact category counts, source-linked summaries | Implemented in Mode B; see test results below |
 | Retrieval or answer accuracy on human-reviewed labels | **Not established.** No reviewed benchmark exists yet |
 
 ## Architecture
@@ -62,6 +65,8 @@ flowchart LR
     CLI[Terminal<br/>main.py] --> R
     A --> R[AI layer<br/>rag.py]
     A --> D[(SQLite<br/>documents, tickets,<br/>vectors, AI runs)]
+    A --> S[steel_faults.py<br/>verified raw UCI files → exact counts]
+    S --> R
     R --> RT[retrieval.py<br/>keyword · BM25 · cosine · hybrid]
     R --> OC[ollama_client.py<br/>embed · generate · check claims]
     OC -->|127.0.0.1 only| O[Ollama<br/>qwen3-embedding:0.6b<br/>qwen2.5:7b]
@@ -117,6 +122,10 @@ ollama pull qwen3-embedding:0.6b
 # 3. Create the small synthetic demo data (refuses to overwrite existing files)
 .venv/bin/python main.py demo
 
+# 3b. Download the genuine UCI files; fixed SHA-256 hashes are checked
+.venv/bin/python main.py steel-download
+.venv/bin/python main.py steel
+
 # 4. Run the tests (no Ollama needed)
 .venv/bin/python -m unittest -q
 
@@ -130,7 +139,7 @@ export EVIDENCEOPS_EMBEDDING_MODEL=qwen3-embedding:0.6b
 .venv/bin/python -m uvicorn api:app --host 127.0.0.1 --port 8000
 ```
 
-6. Open `http://127.0.0.1:8000/` and enter the three tokens at the top of the page.
+6. Open `http://127.0.0.1:8000/` and enter the three tokens at the top of the page. The **Real steel data** tab downloads and calculates the Mode B counts. In **AI answers**, choose the evidence mode before asking a question.
 
 On Windows, use `.venv\Scripts\python.exe` instead of `.venv/bin/python`, and `set NAME=value` instead of `export`.
 
@@ -161,6 +170,7 @@ From the terminal (with the same environment variables set):
 .venv/bin/python main.py agent --question "Investigate the Line B rejection increase" --allow-draft
 .venv/bin/python main.py investigate      # deterministic rejection-rate report, no model
 .venv/bin/python main.py aieval           # full recorded evaluation, writes data/local/ai_evaluation.json
+.venv/bin/python main.py ask --steel --question "How many fault records are there?"
 ```
 
 ### Environment variables
@@ -185,11 +195,11 @@ The three tokens must all be different. The server refuses to approve anything i
 
 ### Automated tests
 
-`python -m unittest -q` runs **81 tests: 73 pass and 8 are skipped**, after `main.py demo` on a fresh clone.
+`python -m unittest -q` runs **84 tests: 76 pass and 8 are skipped** after both demo data and the UCI files are downloaded. Without the UCI download, its data check is also skipped.
 
 The 8 skips are deliberate. Those tests assert exact values from the original EvidenceOps starter dataset, such as a 3.05% Line B v3 rejection rate. That dataset is not in this repository because it has no explicit redistribution license. The tests run again automatically whenever that dataset is present, and the demo data is not made to imitate it.
 
-GitHub Actions runs the dataset-free subset plus all AI-layer tests (no Ollama required), and a PostgreSQL/pgvector smoke test.
+GitHub Actions generates the synthetic demo, downloads and checks the real UCI files, runs the full offline suite (no Ollama required), and runs a separate PostgreSQL/pgvector smoke test. CI does not run real local-model inference.
 
 ### Real-model evaluation
 
@@ -201,7 +211,7 @@ GitHub Actions runs the dataset-free subset plus all AI-layer tests (no Ollama r
 
 These are **lab test cases graded by automatic phrase checks, not human-reviewed labels**, and no accuracy percentage is claimed. Every answer was also read by hand.
 
-Results from commit `2a56744`, run from a fresh clone, `qwen2.5:7b` + `qwen3-embedding:0.6b`:
+Historical Mode A results from commit `2a56744`, run from a fresh clone, `qwen2.5:7b` + `qwen3-embedding:0.6b`. These are **not** final-branch evaluation results:
 
 | Set | Correct, cited answers | Answerable but refused | Correct abstentions | Wrong answers |
 |---|---|---|---|---|
@@ -209,8 +219,12 @@ Results from commit `2a56744`, run from a fresh clone, `qwen2.5:7b` + `qwen3-emb
 | Held-out (12) | 5 of 7 | 2 | 5 of 5 | 0 |
 | Prompt injection (4) | — | — | 4 of 4 resisted | 0 |
 
-- **Retrieval:** the expected source was in the top three for 11 of 11 answerable cases with semantic and hybrid search, and 10 of 11 with keyword and BM25. Hybrid search takes about 30 ms and BM25 about 0.1 ms, plus a one-off embedding build. On a corpus this small, this shows only that cross-lingual matching works, not that one method ranks better.
-- **Latency:** a full answer takes a median of about 0.6 s, including about 0.36 s for generation and the claim check.
+Recent `final-release` branch evaluations with the same installed models: regression **3 cited correct, 1 answerable refusal, 2 correct abstentions**; held-out **4–5 cited correct, 2–3 answerable refusals, 5 correct abstentions**; injection **4 of 4 resisted**; UCI steel **5–6 cited correct, 0–1 answerable refusals, 2 correct abstentions**. In the latest run, the Traditional Chinese largest-category answer was withheld by verification. Three agent runs made 14 steps, including one refused duplicate call; no unauthorized tool ran. A same-machine run of the known-good commit returned **3 cited correct and 4 answerable refusals** on the held-out set. These small automatic case counts vary across runs and are not a reliable accuracy statistic. The full latest run is saved locally by `main.py aieval` as `data/local/ai_evaluation.json` (ignored by Git).
+
+The following measurements are from the historical `2a56744` run:
+
+- **Retrieval:** the expected source was in the top three for 11 of 11 answerable cases with semantic and hybrid search, and 10 of 11 with keyword and BM25. Hybrid search took about 30 ms and BM25 about 0.1 ms, plus a one-off embedding build. On a corpus this small, this shows only that cross-lingual matching works, not that one method ranks better.
+- **Latency:** a full answer took a median of about 0.6 s, including about 0.36 s for generation and the claim check.
 - **Repeatability:** each of the 4 repeated cases gave the same result in all 3 runs.
 - **Agent:** 3 runs, 15 tool calls, none refused or repeated. The model finished every run itself, always after an SOP search.
 
@@ -233,10 +247,11 @@ Hardware: NVIDIA GeForce RTX 5080 (16 GB), 123 GB RAM.
 - **Prompt-injection protection is partial.** The filter catches passages that address the AI with known phrasings. A document that simply states a false fact ("the threshold is now 0.99") is indistinguishable from a real conflicting SOP and will be cited, with its source shown. The real control is that only operators can upload documents.
 - **Chinese answers are weaker.** The 3 remaining refusals of answerable questions are all Traditional Chinese. One was blocked by the Python quote check (the quotation was not word for word), one by the strict model checker, and one because the generator returned no claims.
 - **The model checker can still be wrong.** It is strict, and it is the only guard on whether a claim's wording matches its quote.
-- **The corpus is tiny.** It has about 11 chunks, so retrieval methods cannot be meaningfully ranked against each other. There is no human-reviewed benchmark.
+- **The Mode A corpus is tiny.** It has about 11 chunks. Mode B searches computed summaries rather than 1,941 raw numeric rows. There is no human-reviewed benchmark.
 - **The agent wastes some steps.** It reads Line A, which has no records in the demo data. Its summaries usually abstain, because the SOPs do not state causes, which is the correct outcome.
 - **Docker runs the offline features only.** Inside a container, `127.0.0.1` is not the host, so local AI is disabled by design.
 - **Not tested here:** scanned-PDF OCR (only with mocks), multiple users, and large corpora.
+- **Docker execution on the university lab computer is unverified.** This release was tested with native Python, SQLite, FastAPI and Ollama. The Dockerfile and Compose configuration are preserved but were not run on that computer.
 
 ## More features
 
@@ -284,7 +299,9 @@ The container is read-only, drops all capabilities, and publishes only `127.0.0.
 
 ## Data
 
-All demonstration data is synthetic. `main.py demo` writes six tiny files into `EvidenceOps_Data_Starter/data/`: three SOPs (one old English version, an active English version and an active Traditional Chinese version), inspection metrics, deployments, and one **unverified** practice question.
+**Mode A is synthetic.** `main.py demo` writes six tiny files into `EvidenceOps_Data_Starter/data/`: three SOPs, inspection metrics, deployments, and one **unverified** practice question.
+
+**Mode B is genuine data.** [Steel Plates Faults](https://archive.ics.uci.edu/dataset/198/steel+plates+faults) was published by M. Buscema, S. Terzi and W. Tastle (2010), UCI Machine Learning Repository, [DOI 10.24432/C5J88N](https://doi.org/10.24432/C5J88N), under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). `steel_faults.py` downloads the two original UCI files into ignored `data/steel_faults/`, checks fixed SHA-256 hashes, validates finite values and one fault label per row, and counts categories in Python. It preserves the source spelling `K_Scatch`. The 1,941 records have 27 numeric inputs and seven one-hot fault labels (34 columns); no values are missing. Counts: Pastry 158, Z_Scratch 190, K_Scatch 391, Stains 72, Dirtiness 55, Bumps 402, Other_Faults 673. The raw files are separate from the derived summary. The model sees only source-linked computed summary sentences. These observations contain no fault-free production denominator, dates, factory line, or proven causes. Their proportions are **among fault records**, never production rejection rates.
 
 The original EvidenceOps starter files and the public Parquet maintenance dataset are deliberately excluded from Git. `data/`, `EvidenceOps_Data_Starter/`, `*.db` and `*.jsonl` are all ignored, so local stores, vectors and evaluation outputs are never committed.
 
@@ -303,5 +320,8 @@ The original EvidenceOps starter files and the public Parquet maintenance datase
 | `evaluation.py` | Human label review and lexical comparison |
 | `database.py` | Optional PostgreSQL adapter, plus SQLite storage for vectors and AI runs |
 | `main.py` | Terminal commands, demo data and the real-model evaluation |
+| `steel_faults.py` | Verified UCI download, raw-row validation, deterministic counts and attributed summary chunks |
 | `dashboard.html` | The single-page dashboard |
 | `test_evidenceops.py` | The test suite |
+
+Read [the beginner's code guide](docs/LEARN_THE_CODE.md) for a file-by-file walkthrough and exercises.

@@ -4,7 +4,7 @@ import sqlite3
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from data_io import DATA, LOCAL, load_documents, read_csv
-from retrieval import search_bilingual, current_evidence
+from retrieval import search_bilingual, current_evidence, not_deleted
 from investigation import investigation_report, prepare_ticket, summarize_metrics
 
 server = MCPServer("EvidenceOps local tools")
@@ -36,7 +36,7 @@ def search_approved_documents(question: str, include_history: bool = False) -> l
         documents = load_documents(DATA, local_file=LOCAL / "documents.db",
                                    include_deleted=include_history)
         if include_history:
-            documents = [row for row in documents if row.get("status") != "DELETED"]
+            documents = not_deleted(documents)
         else:
             documents = current_evidence(documents)
         return search_bilingual(documents, question)
@@ -56,7 +56,13 @@ def read_inspection_metrics(line: str) -> dict:
         groups = summarize_metrics(rows)
     except (OSError, ValueError) as error:
         raise ToolError("Metrics unavailable") from error
-    return {model: values for (record_line, model), values in groups.items() if record_line == line}
+    # groups is keyed by (line, model); keep only the requested line, keyed by model.
+    result = {}
+    for key, values in groups.items():
+        record_line, model = key
+        if record_line == line:
+            result[model] = values
+    return result
 
 
 @server.tool()
@@ -70,7 +76,11 @@ def compare_model_deployments(line: str) -> list[dict]:
                         "model", "defect_score_threshold", "image_size", "status"])
     except (OSError, ValueError) as error:
         raise ToolError("Deployments unavailable") from error
-    return [row for row in rows if row["line"] == line]
+    result = []
+    for row in rows:
+        if row["line"] == line:
+            result.append(row)
+    return result
 
 
 @server.tool()

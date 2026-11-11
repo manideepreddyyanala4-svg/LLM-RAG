@@ -55,9 +55,13 @@ def ingest_version(dsn, source, version, digest, chunks):
             raise ValueError("Invalid chunk")
         location = chunk.get("location")
         text = chunk.get("text")
-        if (not isinstance(location, str) or not re.fullmatch(r"(paragraph|page) [1-9][0-9]*", location)
-                or location in locations or not isinstance(text, str) or not text.strip() or len(text) > 100_000):
-            raise ValueError("Chunks need unique locations and nonempty bounded text")
+        problem = "Chunks need unique locations and nonempty bounded text"
+        if not isinstance(location, str) or not re.fullmatch(r"(paragraph|page) [1-9][0-9]*", location):
+            raise ValueError(problem)
+        if location in locations:
+            raise ValueError(problem)
+        if not isinstance(text, str) or not text.strip() or len(text) > 100_000:
+            raise ValueError(problem)
         locations.add(location)
     require_dsn(dsn)
     with psycopg.connect(dsn, connect_timeout=3) as connection:
@@ -200,4 +204,10 @@ def list_ai_runs(path):
         if not connection.execute("SELECT 1 FROM sqlite_master WHERE name='ai_runs'").fetchone():
             return []
         rows = connection.execute("SELECT id, result_json, created_at FROM ai_runs ORDER BY id DESC LIMIT 20").fetchall()
-    return [dict(json.loads(row[1]), run_id=row[0], at=row[2]) for row in rows]
+    runs = []
+    for row in rows:
+        run = json.loads(row[1])
+        run["run_id"] = row[0]
+        run["at"] = row[2]
+        runs.append(run)
+    return runs

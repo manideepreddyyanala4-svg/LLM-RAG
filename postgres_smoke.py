@@ -50,7 +50,10 @@ def check_versions(dsn):
     else:
         raise AssertionError("The expected database write failure did not occur")
     versions = database.list_versions(dsn)
-    current = [row for row in versions if row[0] == "smoke.txt" and row[3]]
+    current = []
+    for row in versions:
+        if row[0] == "smoke.txt" and row[3]:  # row[3] is the "active" flag
+            current.append(row)
     assert len(current) == 1 and current[0][1] == "v2"
     database.delete_inactive_version(dsn, "smoke.txt", "v1")
 

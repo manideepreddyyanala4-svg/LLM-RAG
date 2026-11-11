@@ -4,7 +4,7 @@ from math import isfinite
 import sqlite3
 import hashlib
 from contextlib import closing
-from data_io import read_csv
+from data_io import read_csv, table_columns
 
 
 def summarize_metrics(rows):
@@ -47,7 +47,9 @@ def investigation_report(folder, documents):
     deployment_ids = set()
     line_b_versions = {}
     output = ["Synthetic evidence investigation (deterministic Python; no LLM)"]
-    for (line, model), group in sorted(groups.items()):
+    for key in sorted(groups):
+        line, model = key
+        group = groups[key]
         rate = "undefined (zero inspected)"
         if group["rate"] is not None:
             rate = f"{group['rate']:.2f}%"
@@ -67,16 +69,18 @@ def investigation_report(folder, documents):
         if row["line"] == "B" and row["model"] in ("v3", "v4"):
             if row["model"] in line_b_versions:
                 raise ValueError(f"Multiple Line B {row['model']} deployments; comparison is ambiguous")
-            line_b_versions[row["model"]] = (number, threshold, int(row["image_size"]))
+            line_b_versions[row["model"]] = {"record": number, "threshold": threshold,
+                                              "image_size": int(row["image_size"])}
     if "v3" in line_b_versions and "v4" in line_b_versions:
         old = line_b_versions["v3"]
         new = line_b_versions["v4"]
-        output.append(f"Line B deployment settings: threshold {old[1]} -> {new[1]}, "
-                      f"image size {old[2]} -> {new[2]} "
-                      f"[deployments.csv records {old[0]}, {new[0]}]")
+        output.append(f"Line B deployment settings: threshold {old['threshold']} -> {new['threshold']}, "
+                      f"image size {old['image_size']} -> {new['image_size']} "
+                      f"[deployments.csv records {old['record']}, {new['record']}]")
     before = groups.get(("B", "v3"))
     after = groups.get(("B", "v4"))
-    if before and after and before["rate"] is not None and after["rate"] is not None:
+    both_found = before is not None and after is not None
+    if both_found and before["rate"] is not None and after["rate"] is not None:
         difference = after["rate"] - before["rate"]
         output.append(f"Line B v4 minus v3: {difference:+.2f} percentage points "
                       f"[metrics.csv records {before['records'] + after['records']}]")
@@ -97,7 +101,7 @@ def setup_tickets(connection):
         connection.execute("""CREATE TABLE IF NOT EXISTS tickets
             (id INTEGER PRIMARY KEY, question TEXT NOT NULL, report TEXT NOT NULL,
              state TEXT NOT NULL, request_key TEXT UNIQUE)""")
-        columns = [row[1] for row in connection.execute("PRAGMA table_info(tickets)")]
+        columns = table_columns(connection, "tickets")
         if "request_key" not in columns:
             connection.execute("ALTER TABLE tickets ADD COLUMN request_key TEXT")
             connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS tickets_request_key ON tickets(request_key)")
@@ -105,7 +109,10 @@ def setup_tickets(connection):
             (id INTEGER PRIMARY KEY, ticket_id INTEGER NOT NULL REFERENCES tickets(id),
              old_state TEXT, new_state TEXT NOT NULL, actor TEXT NOT NULL,
              event_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
-        old_ids = [row[0] for row in connection.execute("SELECT id FROM tickets WHERE state='prepared'")]
+        # Older versions called a waiting ticket "prepared"; rename it to "pending" once.
+        old_ids = []
+        for row in connection.execute("SELECT id FROM tickets WHERE state='prepared'"):
+            old_ids.append(row[0])
         for ticket_id in old_ids:
             connection.execute("UPDATE tickets SET state='pending' WHERE id=?", (ticket_id,))
             connection.execute("""INSERT INTO ticket_events (ticket_id, old_state, new_state, actor)
@@ -143,7 +150,10 @@ def list_tickets(path):
     with closing(sqlite3.connect(path, timeout=3)) as connection:
         setup_tickets(connection)
         rows = connection.execute("SELECT id, question, state FROM tickets ORDER BY id DESC").fetchall()
-    return [dict(id=row[0], question=row[1], state=row[2]) for row in rows]
+    tickets = []
+    for row in rows:
+        tickets.append({"id": row[0], "question": row[1], "state": row[2]})
+    return tickets
 
 
 def approve_ticket(path, ticket_id):
@@ -182,4 +192,7 @@ def ticket_history(path, ticket_id):
         exists = connection.execute("SELECT 1 FROM tickets WHERE id=?", (ticket_id,)).fetchone()
         if not exists:
             raise ValueError("Ticket not found")
-    return [dict(old_state=row[0], new_state=row[1], actor=row[2], at=row[3]) for row in rows]
+    events = []
+    for row in rows:
+        events.append({"old_state": row[0], "new_state": row[1], "actor": row[2], "at": row[3]})
+    return events
